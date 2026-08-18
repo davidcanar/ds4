@@ -30364,6 +30364,50 @@ static bool metal_graph_encode_layer_ffn_batch(
         ok = metal_graph_encode_mixed_routed_rows(
                 g, decode_items, decode_count, model, layer, il, n_tokens);
     } else if (ok && tp_split_batch_moe) {
+#if defined(DS4_ROCM_BUILD)
+        /* Verify-block expert split, batched: the ROCm launcher restricts
+         * experts to this rank's contiguous half (tp_first/tp_count reach
+         * every kernel), so one grouped dispatch computes every row's owned
+         * partial straight into the slab batch rows.  This replaces the
+         * per-row single-token fallback below, which cost one full routed
+         * dispatch per draft row (~6x the launches and none of the
+         * cross-row concurrency).  Metal keeps the per-row path: its batch
+         * kernels do not take the expert ownership range. */
+        ds4_gpu_tensor *tp_rows_out = ds4_gpu_tensor_view(
+                g->tp_batch_out[il], 0,
+                (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float));
+        ok = tp_rows_out &&
+             ds4_gpu_routed_moe_batch_tensor(tp_rows_out,
+                                             metal_graph_batch_routed_gate(g),
+                                             metal_graph_batch_routed_up(g),
+                                             metal_graph_batch_routed_mid(g),
+                                             metal_graph_batch_routed_down(g),
+                                             model->map,
+                                             model->size,
+                                             layer->ffn_gate_exps->abs_offset,
+                                             layer->ffn_up_exps->abs_offset,
+                                             layer->ffn_down_exps->abs_offset,
+                                             layer->ffn_gate_exps->type,
+                                             layer->ffn_down_exps->type,
+                                             gate_expert_bytes,
+                                             gate_row_bytes,
+                                             down_expert_bytes,
+                                             down_row_bytes,
+                                             (uint32_t)expert_in_dim,
+                                             (uint32_t)down_in_dim,
+                                             (uint32_t)routed_out_dim,
+                                             metal_graph_batch_router_selected(g),
+                                             metal_graph_batch_router_weights(g),
+                                             DS4_N_EXPERT,
+                                             DS4_N_EXPERT_USED,
+                                             DS4_SWIGLU_CLAMP_EXP,
+                                             metal_graph_batch_ffn_norm(g),
+                                             il,
+                                             n_tokens,
+                                             &g->batch_routed_mid_is_f16,
+                                             false) != 0;
+        ds4_gpu_tensor_free(tp_rows_out);
+#else
         /* Verify-block expert split: run the contiguous-half split
          * single-token routed kernels per row into the slab batch-out
          * rows, exchange all rows with one gate, then materialize the
@@ -30415,6 +30459,7 @@ static bool metal_graph_encode_layer_ffn_batch(
             ds4_gpu_tensor_free(x_row);
             ds4_gpu_tensor_free(out_row);
         }
+#endif
         if (ok) ok = ds4_gpu_tp_batch_gate_encode(il, n_tokens) != 0;
         if (ok) {
             ok = ds4_gpu_add_tensor(metal_graph_batch_routed_out(g),

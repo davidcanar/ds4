@@ -1414,6 +1414,128 @@ static int tp_rdma_bulk_reset(ds4_tp *tp) {
     return 1;
 }
 
+/* Verify batch gates always fit one bulk round and live inside the
+ * registered slab, so their recvs can be posted before the header handshake
+ * and the header read doubles as the posted-recv barrier.  That halves the
+ * control-plane cost per gate: one round trip instead of the header plus
+ * the explicit one-byte recv barrier of the multi-round prefill path. */
+static int tp_rdma_bulk_prepost_recvs(ds4_tp *tp, void *in, uint64_t bytes,
+                                      uint32_t *chunks_out) {
+    ds4_tp_rdma *r = &tp->rdma;
+    if (bytes == 0 ||
+        bytes > (uint64_t)DS4_TP_RDMA_BULK_SLOTS * DS4_TP_RDMA_MAX_MSG) {
+        return 0;
+    }
+    const uint32_t chunks =
+        (uint32_t)((bytes + DS4_TP_RDMA_MAX_MSG - 1u) / DS4_TP_RDMA_MAX_MSG);
+    struct ibv_sge sge[DS4_TP_RDMA_BULK_SLOTS];
+    struct ibv_recv_wr wr[DS4_TP_RDMA_BULK_SLOTS];
+    memset(wr, 0, sizeof(wr[0]) * chunks);
+    uint64_t off = 0;
+    for (uint32_t i = 0; i < chunks; i++) {
+        const uint64_t left = bytes - off;
+        const uint32_t len = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ?
+                                        DS4_TP_RDMA_MAX_MSG : left);
+        sge[i].addr = (uintptr_t)in + off;
+        sge[i].length = len;
+        sge[i].lkey = r->mr->lkey;
+        wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
+        wr[i].sg_list = &sge[i];
+        wr[i].num_sge = 1;
+        wr[i].next = i + 1u < chunks ? &wr[i + 1u] : NULL;
+        off += len;
+    }
+    struct ibv_recv_wr *bad = NULL;
+    const int rc = ibv_post_recv(r->qp2, wr, &bad);
+    if (rc != 0) {
+        fprintf(stderr, "ds4-tp: batch gate post_recv: rc=%d (%s)\n",
+                rc, strerror(rc));
+        (void)tp_rdma_bulk_reset(tp);
+        return 0;
+    }
+    *chunks_out = chunks;
+    return 1;
+}
+
+static int tp_rdma_bulk_send_and_poll(ds4_tp *tp, const void *out,
+                                      uint64_t bytes, uint32_t chunks) {
+    ds4_tp_rdma *r = &tp->rdma;
+    atomic_thread_fence(memory_order_release);
+    struct ibv_sge sge[DS4_TP_RDMA_BULK_SLOTS];
+    struct ibv_send_wr wr[DS4_TP_RDMA_BULK_SLOTS];
+    memset(wr, 0, sizeof(wr[0]) * chunks);
+    uint64_t off = 0;
+    for (uint32_t i = 0; i < chunks; i++) {
+        const uint64_t left = bytes - off;
+        const uint32_t len = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ?
+                                        DS4_TP_RDMA_MAX_MSG : left);
+        sge[i].addr = (uintptr_t)out + off;
+        sge[i].length = len;
+        sge[i].lkey = r->mr->lkey;
+        wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
+        wr[i].sg_list = &sge[i];
+        wr[i].num_sge = 1;
+        wr[i].opcode = IBV_WR_SEND;
+        wr[i].send_flags = i + 1u == chunks ? IBV_SEND_SIGNALED : 0;
+        wr[i].next = i + 1u < chunks ? &wr[i + 1u] : NULL;
+        off += len;
+    }
+    struct ibv_send_wr *bad = NULL;
+    const int rc = ibv_post_send(r->qp2, wr, &bad);
+    if (rc != 0) {
+        fprintf(stderr, "ds4-tp: batch gate post_send: rc=%d (%s)\n",
+                rc, strerror(rc));
+        (void)tp_rdma_bulk_reset(tp);
+        return 0;
+    }
+    uint32_t recv_done = 0;
+    int send_done = 0;
+    const double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    uint32_t peer_poll = 0;
+    while (recv_done < chunks || !send_done) {
+        struct ibv_wc wc[DS4_TP_RDMA_BULK_SLOTS + 1u];
+        int n = ibv_poll_cq(r->cq, (int)(DS4_TP_RDMA_BULK_SLOTS + 1u), wc);
+        if (n < 0) return 0;
+        for (int i = 0; i < n; i++) {
+            if (wc[i].status != IBV_WC_SUCCESS) {
+                fprintf(stderr,
+                        "ds4-tp: batch gate completion error: %s\n",
+                        tp_wc_status_str(wc[i].status));
+                (void)tp_rdma_bulk_reset(tp);
+                return 0;
+            }
+            if ((wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) == 0) {
+                /* Leftover latency-QP completions, same as the prefill
+                 * bulk path. */
+                if (wc[i].opcode & IBV_WC_RECV) {
+                    if (wc[i].wr_id > r->recv_done)
+                        r->recv_done = wc[i].wr_id;
+                } else if (r->send_outstanding > 0) {
+                    r->send_outstanding--;
+                }
+                continue;
+            }
+            if (wc[i].opcode & IBV_WC_RECV) recv_done++;
+            else send_done = 1;
+        }
+        if ((peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
+            fprintf(stderr,
+                    "ds4-tp: peer disconnected during batch gate\n");
+            return 0;
+        }
+        if (tp_now_sec() > deadline) {
+            fprintf(stderr,
+                    "ds4-tp: timeout waiting for batch gate round "
+                    "(%u/%u recvs, send=%d)\n",
+                    recv_done, chunks, send_done);
+            (void)tp_rdma_bulk_reset(tp);
+            return 0;
+        }
+    }
+    atomic_thread_fence(memory_order_acquire);
+    return 1;
+}
+
 static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                                      const void *out,
                                      void *in,
@@ -1844,6 +1966,17 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                              (uint16_t)rows, seq, bytes };
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
+        /* Post the recvs before the header handshake: the peer's header
+         * write happens after its own recvs are posted, so the header read
+         * is the barrier and the gate costs one round trip, not two. */
+        uint32_t chunks = 0;
+        if (!tp_rdma_bulk_prepost_recvs(
+                    tp,
+                    tp->slab + ds4_tp_slab_batch_in_offset(tp, layer),
+                    bytes,
+                    &chunks)) {
+            return 0;
+        }
         if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
         ds4_tp_gate_header ph;
         if (!tp_read_full_deadline(tp, tp->data_fd, &ph, sizeof(ph))) return 0;
@@ -1859,11 +1992,11 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
             (void)tp_rdma_bulk_reset(tp);
             return 0;
         }
-        return tp_rdma_big_gate_exchange(
+        return tp_rdma_bulk_send_and_poll(
                 tp,
                 tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
-                tp->slab + ds4_tp_slab_batch_in_offset(tp, layer),
-                bytes);
+                bytes,
+                chunks);
     }
 #endif
     struct iovec iov[2] = {

@@ -304,20 +304,27 @@ static void *ds4_rocm_tp_service_thread(void *arg) {
             }
         }
         if (getenv("DS4_TP_TIMING")) {
-            static uint64_t cnt;
-            static double sum_arr, sum_ex, sum_tot;
+            /* Bucketed by gate kind so decode row gates do not average away
+             * the verify batch gates and prefill big gates. */
+            static uint64_t cnt[4];
+            static double sum_arr[4], sum_ex[4];
+            static uint64_t total;
+            const int ti = req.split ? 2 : (req.big ? 3 : (req.rows != 0u ? 1 : 0));
             double after_ex = ds4_rocm_tp_now_sec();
-            cnt++;
-            sum_arr += arrive_t - gate_t0;
-            sum_ex += after_ex - arrive_t;
-            sum_tot += after_ex - gate_t0;
-            if ((cnt % 256u) == 0u) {
-                fprintf(stderr, "ds4-tp timing: n=%llu arrival=%5.1fus exchange=%5.1fus total=%5.1fus\n",
-                        (unsigned long long)cnt,
-                        sum_arr * 1e6 / (double)cnt,
-                        sum_ex * 1e6 / (double)cnt,
-                        sum_tot * 1e6 / (double)cnt);
-                sum_arr = sum_ex = sum_tot = 0.0;
+            cnt[ti]++;
+            sum_arr[ti] += arrive_t - gate_t0;
+            sum_ex[ti] += after_ex - arrive_t;
+            if ((++total % 512u) == 0u) {
+                static const char *names[4] = { "row", "batch", "split", "big" };
+                for (int i = 0; i < 4; i++) {
+                    if (cnt[i] == 0) continue;
+                    fprintf(stderr,
+                            "ds4-tp timing %-5s: n=%6llu arrival=%7.1fus exchange=%7.1fus\n",
+                            names[i],
+                            (unsigned long long)cnt[i],
+                            sum_arr[i] * 1e6 / (double)cnt[i],
+                            sum_ex[i] * 1e6 / (double)cnt[i]);
+                }
             }
         }
         if (!ok) {

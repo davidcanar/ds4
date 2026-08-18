@@ -1125,7 +1125,13 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     if (!attn_output_cublas) {
         if ((group_dim & 31u) == 0u && rank <= UINT32_MAX && n_tokens <= UINT32_MAX) {
             const uint32_t rows_per_block = 32u;
-            const uint32_t tile = 32u;
+            /* Match the tile to small batches (verify blocks): a 32-token
+             * tile reserves 64 KiB LDS and caps residency at one workgroup
+             * per CU while most tile lanes carry padding. */
+            const uint32_t tile = n_tokens <= 2u ? 2u :
+                                  n_tokens <= 4u ? 4u :
+                                  n_tokens <= 8u ? 8u :
+                                  n_tokens <= 16u ? 16u : 32u;
             const uint32_t block_tile = 16u;
             cuda_launch_grouped_q8_a_sharedx((float *)low->ptr,
                                              out_a,
