@@ -63427,8 +63427,13 @@ uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer) {
 }
 
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
-    (void)e;
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) return DS4_N_EMBD;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        /* GLM 5.3 slice boundaries carry the hyper-connection-expanded
+         * state the graph reads/writes; GLM 5.2 boundaries are plain
+         * hidden states. */
+        return ds4_engine_is_glm53(e) ? (uint64_t)DS4_N_HC * DS4_N_EMBD
+                                      : (uint64_t)DS4_N_EMBD;
+    }
     return (uint64_t)DS4_N_HC * DS4_N_EMBD;
 }
 
@@ -65294,7 +65299,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             return 1;
         }
 
-        const uint64_t hidden_dim = DS4_N_EMBD;
+        const uint64_t hidden_dim = ds4_engine_hidden_f32_values(e);
 #ifdef DS4_ROCM_BUILD
         const bool rocm_layer_slice_token_decode =
             glm_graph_env_truthy(
