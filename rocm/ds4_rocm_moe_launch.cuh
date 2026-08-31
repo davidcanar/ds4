@@ -817,9 +817,11 @@ static int routed_moe_launch(
         const uint32_t use_sorted_pairs =
             n_tokens > 1u &&
             !use_mxfp4_tiny_batch &&
+            getenv("DS4_ROCM_DISABLE_SORTED_PAIRS") == NULL &&
             (!q4k_path || n_tokens >= q4k_sorted_min_cached) &&
             !disable_resident_iq2_sorted;
-        const uint32_t use_expert_tiles = use_sorted_pairs;
+        const uint32_t use_expert_tiles = use_sorted_pairs &&
+            getenv("DS4_ROCM_DISABLE_EXPERT_TILES") == NULL;
         const uint32_t expert_tile_m = n_tokens <= 8u ? 4u : 8u;
         const uint32_t write_gate_up = 0u;
         const uint32_t use_p2_sorted = 0u;
