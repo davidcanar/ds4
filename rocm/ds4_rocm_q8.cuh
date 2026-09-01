@@ -772,8 +772,9 @@ __global__ static void matmul_q8_0_f32_batch_sharedx_exact8_kernel(
     for (uint32_t u = 0; u < TOK_TILE; ++u) acc[u] = warp_sum_f32(acc[u]);
     if (lane == 0u && row_valid) {
 #pragma unroll
-    for (uint32_t u = 0; u < TOK_TILE; ++u) {
-        out[(uint64_t)u * out_dim + row] = acc[u];
+        for (uint32_t u = 0; u < TOK_TILE; ++u) {
+            out[(uint64_t)u * out_dim + row] = acc[u];
+        }
     }
 }
 
