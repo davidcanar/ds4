@@ -618,6 +618,12 @@ int ds4_session_dist_dspark_draft(ds4_session *s, int token, uint32_t pos,
                                   int *drafts, int max_drafts, int *n_drafts,
                                   char *err, size_t errlen);
 /* Dispatch by the loaded support model kind (legacy MTP head or DSpark). */
+int ds4_session_glm_dist_draft(ds4_session *s, int token, uint32_t pos,
+                                int *drafts, int max_drafts, int *n_drafts,
+                                char *err, size_t errlen);
+bool ds4_session_glm_dist_spec_span_begin(ds4_session *s, uint32_t pos0,
+                                          uint32_t rows, bool spec_verify,
+                                          bool spec_rollback);
 int ds4_session_dist_support_draft(ds4_session *s, int token, uint32_t pos,
                                    int *drafts, int max_drafts, int *n_drafts,
                                    char *err, size_t errlen);

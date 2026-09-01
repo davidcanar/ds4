@@ -707,6 +707,9 @@ static const ds4_shape DS4_SHAPE_GLM53 = {
     .kda_gate_lower_bound = -5.0f,
 };
 
+/* Worker slices that map the GLM nextn/MTP block for chained drafting. */
+static bool g_nextn_slice_include = false;
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -6414,7 +6417,8 @@ static void weights_bind(
         uint32_t         load_layer_start,
         uint32_t         load_layer_end,
         bool             require_output,
-        bool             optional_output) {
+        bool             optional_output,
+        bool             include_nextn) {
     memset(w, 0, sizeof(*w));
 
     uint32_t executable_layers = DS4_N_LAYER;
@@ -6430,7 +6434,7 @@ static void weights_bind(
         start = load_layer_start;
         end = load_layer_end == UINT32_MAX ? executable_layers - 1u : load_layer_end;
         if (end >= executable_layers || end < start) ds4_die("invalid model load layer slice");
-        require_token_embd = start == 0;
+        require_token_embd = start == 0 || include_nextn;
     } else {
         require_output = true;
         optional_output = false;
@@ -6447,10 +6451,12 @@ static void weights_bind(
         weights_bind_layer(&w->layer[il], m, il);
     }
     /* GLM nextn/MTP block(s): excluded from the executable pass but bound
-     * so the drafter can run them. Only when the full model is loaded. */
-    if (!load_slice &&
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
-        start == 0 && end == executable_layers - 1u) {
+     * so the drafter can run them. Full-model loads do this implicitly; a
+     * distributed worker that owns the output head needs it too when GLM
+     * MTP speculation is enabled (include_nextn). */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+        ((!load_slice && start == 0 && end == executable_layers - 1u) ||
+         include_nextn)) {
         for (uint32_t il = executable_layers; il < DS4_N_LAYER; il++) {
             weights_bind_layer(&w->layer[il], m, il);
         }
@@ -6928,9 +6934,22 @@ static DS4_MAYBE_UNUSED bool weights_model_map_spans(
     if (layer_end >= DS4_N_LAYER || layer_end < layer_start) return false;
 
     memset(spans, 0, sizeof(*spans));
-    if (layer_start == 0) model_map_span_vec_include_one(spans, w->token_embd);
+    if (layer_start == 0 || g_nextn_slice_include) {
+        model_map_span_vec_include_one(spans, w->token_embd);
+    }
     for (uint32_t il = layer_start; il <= layer_end; il++) {
         model_map_span_vec_include_layer(spans, &w->layer[il]);
+    }
+    /* A distributed worker that owns the output head also maps the GLM
+     * nextn/MTP block when chained drafting is enabled. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+        g_nextn_slice_include &&
+        layer_end < DS4_N_LAYER &&
+        w->layer[DS4_N_LAYER - DS4_N_NEXTN_PREDICT].nextn_eh_proj) {
+        for (uint32_t il = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+             il < DS4_N_LAYER; il++) {
+            model_map_span_vec_include_layer(spans, &w->layer[il]);
+        }
     }
     if (include_output) model_map_span_vec_include_output(spans, w);
     return model_map_span_vec_finish(spans);
@@ -40483,6 +40502,17 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *mtp_kda_backup;
     float          *mtp_logits_host;
     int             mtp_ready;
+    /* GLM-5.3 distributed speculation: when armed, KDA layers process the
+     * first dist_spec_base_split rows of a span separately and snapshot
+     * their (conv, recurrent) state right after them, so a rejected
+     * speculative suffix can roll every KDA layer back to the post-base
+     * point without replaying the base row. dist_spec_saved_* track the
+     * span extent covered by the current snapshot for implicit rollback
+     * when a later span starts inside the speculative region. */
+    uint32_t dist_spec_base_split;
+    uint32_t dist_spec_saved_pos;
+    uint32_t dist_spec_saved_rows;
+    bool dist_spec_saved;
     ds4_gpu_tensor *layer_indexer_key_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_indexer_tail_k[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_indexer_tail_gate[DS4_MAX_LAYER];
@@ -43234,6 +43264,11 @@ static bool glm53_graph_hc_pre_rows(
     return ok;
 }
 
+static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g);
+static bool glm53_graph_copy_kda_state_layer(ds4_glm_gpu_graph *g,
+                                             uint32_t il,
+                                             bool save);
+
 static bool glm53_graph_kda_attention_rows(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -43318,28 +43353,85 @@ static bool glm53_graph_kda_attention_rows(
             (uint64_t)rows * projection, il, pos0);
     if (ok) failed_stage = "KDA recurrence";
     if (ok) failed_weight = NULL;
-    if (ok) ok = ds4_gpu_glm53_kda_prefill(
-            g->batch_kda_out,
-            g->layer_kda_conv_state[il],
-            g->layer_kda_recurrent_state[il],
-            g->batch_kda_q,
-            g->batch_kda_k,
-            g->batch_kda_v,
-            g->batch_kda_raw_gate,
-            g->batch_kda_raw_beta,
-            g->batch_kda_output_gate,
-            model->map,
-            model->size,
-            l->kda_q_conv->abs_offset,
-            l->kda_k_conv->abs_offset,
-            l->kda_v_conv->abs_offset,
-            l->kda_a_log->abs_offset,
-            l->kda_dt_bias->abs_offset,
-            l->kda_o_norm->abs_offset,
-            DS4_N_KDA_HEAD,
-            rows,
-            DS4_KDA_GATE_LOWER_BOUND,
-            DS4_RMS_EPS) != 0;
+    const uint32_t spec_split =
+        (g->dist_spec_base_split != 0u && rows > 1u &&
+         getenv("DS4_GLM_SPEC_SPLIT_DISABLE") == NULL)
+            ? (rows < g->dist_spec_base_split ? rows : g->dist_spec_base_split)
+            : rows;
+    for (uint32_t row0 = 0; ok && row0 < rows; ) {
+        const uint32_t n = row0 == 0u ? spec_split : rows - spec_split;
+        if (n == 0u) break;
+        ds4_gpu_tensor *out_view = ds4_gpu_tensor_view(
+                g->batch_kda_out,
+                (uint64_t)row0 * (uint64_t)DS4_N_KDA_HEAD * (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float),
+                (uint64_t)n * (uint64_t)DS4_N_KDA_HEAD * (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float));
+        ds4_gpu_tensor *q_view = ds4_gpu_tensor_view(
+                g->batch_kda_q,
+                (uint64_t)row0 * (uint64_t)DS4_N_KDA_HEAD * (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float),
+                (uint64_t)n * (uint64_t)DS4_N_KDA_HEAD * (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float));
+        ds4_gpu_tensor *k_view = ds4_gpu_tensor_view(
+                g->batch_kda_k,
+                (uint64_t)row0 * (uint64_t)DS4_N_KDA_HEAD * (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float),
+                (uint64_t)n * (uint64_t)DS4_N_KDA_HEAD * (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float));
+        ds4_gpu_tensor *v_view = ds4_gpu_tensor_view(
+                g->batch_kda_v,
+                (uint64_t)row0 * (uint64_t)DS4_N_KDA_HEAD * (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float),
+                (uint64_t)n * (uint64_t)DS4_N_KDA_HEAD * (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float));
+        ds4_gpu_tensor *gate_view = ds4_gpu_tensor_view(
+                g->batch_kda_raw_gate,
+                (uint64_t)row0 * (uint64_t)DS4_N_KDA_HEAD * (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float),
+                (uint64_t)n * (uint64_t)DS4_N_KDA_HEAD * (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float));
+        ds4_gpu_tensor *beta_view = ds4_gpu_tensor_view(
+                g->batch_kda_raw_beta,
+                (uint64_t)row0 * (uint64_t)DS4_N_KDA_HEAD * sizeof(float),
+                (uint64_t)n * (uint64_t)DS4_N_KDA_HEAD * sizeof(float));
+        ds4_gpu_tensor *ogate_view = ds4_gpu_tensor_view(
+                g->batch_kda_output_gate,
+                (uint64_t)row0 * (uint64_t)DS4_N_KDA_HEAD * (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float),
+                (uint64_t)n * (uint64_t)DS4_N_KDA_HEAD * (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float));
+        ok = out_view && q_view && k_view && v_view && gate_view &&
+             beta_view && ogate_view;
+        if (ok) {
+            ok = ds4_gpu_glm53_kda_prefill(
+                    out_view,
+                    g->layer_kda_conv_state[il],
+                    g->layer_kda_recurrent_state[il],
+                    q_view,
+                    k_view,
+                    v_view,
+                    gate_view,
+                    beta_view,
+                    ogate_view,
+                    model->map,
+                    model->size,
+                    l->kda_q_conv->abs_offset,
+                    l->kda_k_conv->abs_offset,
+                    l->kda_v_conv->abs_offset,
+                    l->kda_a_log->abs_offset,
+                    l->kda_dt_bias->abs_offset,
+                    l->kda_o_norm->abs_offset,
+                    DS4_N_KDA_HEAD,
+                    n,
+                    DS4_KDA_GATE_LOWER_BOUND,
+                    DS4_RMS_EPS) != 0;
+        }
+        ds4_gpu_tensor_free(out_view);
+        ds4_gpu_tensor_free(q_view);
+        ds4_gpu_tensor_free(k_view);
+        ds4_gpu_tensor_free(v_view);
+        ds4_gpu_tensor_free(gate_view);
+        ds4_gpu_tensor_free(beta_view);
+        ds4_gpu_tensor_free(ogate_view);
+        if (ok && row0 == 0u && spec_split < rows) {
+            /* Snapshot this layer's KDA state right after the committed
+             * base rows so a rejected speculative suffix can roll back
+             * without replaying them. */
+            ok = glm_graph_mtp_ensure(g) &&
+                 glm53_graph_copy_kda_state_layer(g, il, true);
+            if (ok) g->dist_spec_saved = true;
+        }
+        row0 += n;
+    }
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_out_ready", g->batch_kda_out,
             (uint64_t)rows * projection, il, pos0);
@@ -46433,6 +46525,36 @@ static uint64_t glm53_graph_kda_state_bytes(const ds4_glm_gpu_graph *g) {
     return total;
 }
 
+static bool glm53_graph_copy_kda_state_layer(
+        ds4_glm_gpu_graph *g,
+        uint32_t il,
+        bool save) {
+    if (!g || !g->glm53 || !g->mtp_kda_backup || !ds4_glm53_layer_is_kda(il)) {
+        return true;
+    }
+    ds4_gpu_tensor *state[2] = {
+        g->layer_kda_conv_state[il],
+        g->layer_kda_recurrent_state[il],
+    };
+    uint64_t offset = 0;
+    bool ok = true;
+    for (uint32_t li = g->layer_start; ok && li < il; li++) {
+        if (!ds4_glm53_layer_is_kda(li)) continue;
+        offset += ds4_gpu_tensor_bytes(g->layer_kda_conv_state[li]) +
+                  ds4_gpu_tensor_bytes(g->layer_kda_recurrent_state[li]);
+    }
+    for (uint32_t i = 0; ok && i < 2; i++) {
+        const uint64_t bytes = ds4_gpu_tensor_bytes(state[i]);
+        if (save) {
+            ok = ds4_gpu_tensor_copy(g->mtp_kda_backup, offset, state[i], 0, bytes) != 0;
+        } else {
+            ok = ds4_gpu_tensor_copy(state[i], 0, g->mtp_kda_backup, offset, bytes) != 0;
+        }
+        offset += bytes;
+    }
+    return ok;
+}
+
 static bool glm53_graph_copy_kda_state(
         ds4_glm_gpu_graph *g,
         bool save) {
@@ -46593,6 +46715,7 @@ static bool glm_graph_mtp_step(
         int                next_token,
         uint32_t           pos,
         uint32_t           min_pos,
+        const ds4_gpu_tensor *chain_hidden,
         int               *draft_out) {
     if (!g || !model || !weights || !draft_out) return false;
     if (DS4_N_NEXTN_PREDICT == 0) return false;
@@ -46694,8 +46817,8 @@ static bool glm_graph_mtp_step(
                                                 DS4_N_EMBD,
                                                 DS4_RMS_EPS) != 0;
     DS4_GLM_MTP_STAGE("hnorm");
-    const ds4_gpu_tensor *target_hidden = g->cur;
-    if (ok && g->glm53) {
+    const ds4_gpu_tensor *target_hidden = chain_hidden ? chain_hidden : g->cur;
+    if (ok && !chain_hidden && g->glm53) {
         ok = ds4_gpu_hc_weighted_sum_tensor(g->hc_output,
                                             g->hc_cur,
                                             g->hc_mean_weights,
@@ -46980,6 +47103,28 @@ static bool glm_graph_mtp_step(
                                  0,
                                  g->mtp_logits_host,
                                  (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (ok && getenv("DS4_GLM53DBG")) {
+        int top[3] = {0, 0, 0};
+        float topv[3] = {0.0f, 0.0f, 0.0f};
+        for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
+            const float v = g->mtp_logits_host[i];
+            if (v > topv[0]) {
+                top[2] = top[1]; topv[2] = topv[1];
+                top[1] = top[0]; topv[1] = topv[0];
+                top[0] = (int)i; topv[0] = v;
+            } else if (v > topv[1]) {
+                top[2] = top[1]; topv[2] = topv[1];
+                top[1] = (int)i; topv[1] = v;
+            } else if (v > topv[2]) {
+                top[2] = (int)i; topv[2] = v;
+            }
+        }
+        fprintf(stderr,
+                "GLM53DBG mtp step token=%d pos=%u n_sel=%u top=%d %.1f %d %.1f %d %.1f\n",
+                next_token, pos, n_selected,
+                top[0], (double)topv[0], top[1], (double)topv[1],
+                top[2], (double)topv[2]);
     }
     ds4_gpu_tensor_free(enorm_view);
     ds4_gpu_tensor_free(hnorm_view);
@@ -55305,7 +55450,20 @@ bool ds4_engine_has_mtp(ds4_engine *e) {
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
-        return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;
+        if (!e->glm_mtp || DS4_N_NEXTN_PREDICT == 0) return 0;
+        /* Chained nextn drafting over the pipeline is experimental: on the
+         * 2x Strix Halo ROCm cluster the fused verify spans cost more than
+         * the ~40-60% first-draft agreement pays back, so it stays OFF
+         * unless DS4_GLM_MTP_DRAFTS (1..5 drafts per committed token) is
+         * explicitly set. The returned block size is base + drafts. */
+        int k = -1;
+        const char *env = getenv("DS4_GLM_MTP_DRAFTS");
+        if (env && env[0]) {
+            const int v = atoi(env);
+            if (v >= 1 && v <= 5) k = v;
+        }
+        if (k < 0) return 0;
+        return 1 + k;
     }
     if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
 #ifndef DS4_NO_GPU
@@ -55552,6 +55710,94 @@ int ds4_session_dist_dspark_draft(ds4_session *s, int token, uint32_t pos,
     return 0;
 }
 
+int ds4_session_glm_dist_draft(ds4_session *s, int token, uint32_t pos,
+                                int *drafts, int max_drafts, int *n_drafts,
+                                char *err, size_t errlen) {
+    if (n_drafts) *n_drafts = 0;
+    if (!s || !s->engine || !ds4_session_is_glm(s) || !drafts) {
+        if (errlen) snprintf(err, errlen, "invalid GLM distributed draft session");
+        return 1;
+    }
+    ds4_engine *e = s->engine;
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    if (!e->glm_mtp || DS4_N_NEXTN_PREDICT == 0 || !s->glm_graph_ready ||
+        max_drafts <= 0) {
+        if (errlen) snprintf(err, errlen, "GLM MTP drafting is not armed");
+        return 1;
+    }
+    if (!glm_graph_mtp_ensure(g)) {
+        if (errlen) snprintf(err, errlen, "GLM MTP scratch allocation failed");
+        return 1;
+    }
+    /* mtp_step(X, p) runs the nextn block at absolute position p with
+     * [embed(X), hidden at p] and predicts p+1. The caller's 'token' is
+     * the prediction for 'pos', while g->cur holds the hidden of the row
+     * at pos-1: run the first block at pos-1, exactly like the single-box
+     * cycle does (mtp_step(n1, pos) after committing first_token at pos). */
+    const uint32_t base_pos = pos - 1u;
+    if (s->glm_mtp_min_pos == 0 || s->glm_mtp_min_pos > base_pos) {
+        s->glm_mtp_min_pos = base_pos;
+    }
+    int d = -1;
+    if (!glm_graph_mtp_step(g, &e->model, &e->weights, token, base_pos,
+                            s->glm_mtp_min_pos, NULL, &d)) {
+        if (errlen) snprintf(err, errlen, "GLM MTP draft step failed");
+        return 1;
+    }
+    if (getenv("DS4_MTP_SPEC_LOG")) {
+        fprintf(stderr, "ds4: glm dist draft: token=%d pos=%u base_pos=%u d0=%d\n",
+                token, pos, base_pos, d);
+    }
+    int n = 0;
+    while (n < max_drafts) {
+        drafts[n++] = d;
+        if (n == max_drafts) break;
+        if (ds4_gpu_tensor_copy(g->hc_output, 0, g->next, 0,
+                                (uint64_t)DS4_N_EMBD * sizeof(float)) == 0) {
+            break;
+        }
+        int d2 = -1;
+        if (!glm_graph_mtp_step(g, &e->model, &e->weights, d,
+                                base_pos + (uint32_t)n, s->glm_mtp_min_pos,
+                                g->hc_output, &d2)) {
+            break;
+        }
+        d = d2;
+    }
+    if (n_drafts) *n_drafts = n;
+    return 0;
+}
+
+bool ds4_session_glm_dist_spec_span_begin(ds4_session *s, uint32_t pos0,
+                                          uint32_t rows, bool spec_verify,
+                                          bool spec_rollback) {
+    if (!s || !s->engine || !ds4_session_is_glm(s) || !s->glm_graph_ready) {
+        return true;
+    }
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    if (spec_rollback) {
+        if (g->dist_spec_saved) {
+            (void)glm53_graph_copy_kda_state(g, false);
+            g->dist_spec_saved = false;
+        }
+        g->dist_spec_base_split = 0u;
+        return true;
+    }
+    if (g->dist_spec_saved && rows > 0u &&
+        pos0 < g->dist_spec_saved_pos + g->dist_spec_saved_rows) {
+        (void)glm53_graph_copy_kda_state(g, false);
+        g->dist_spec_saved = false;
+    }
+    if (spec_verify && rows > 1u) {
+        g->dist_spec_base_split = 1u;
+        g->dist_spec_saved_pos = pos0;
+        g->dist_spec_saved_rows = rows;
+    } else {
+        g->dist_spec_base_split = 0u;
+    }
+    return true;
+}
+
 int ds4_session_dist_support_draft(ds4_session *s, int token, uint32_t pos,
                                    int *drafts, int max_drafts, int *n_drafts,
                                    char *err, size_t errlen) {
@@ -55559,6 +55805,11 @@ int ds4_session_dist_support_draft(ds4_session *s, int token, uint32_t pos,
     if (!s || !s->engine) {
         if (errlen) snprintf(err, errlen, "missing distributed draft session");
         return 1;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        return ds4_session_glm_dist_draft(s, token, pos, drafts,
+                                          max_drafts, n_drafts,
+                                          err, errlen);
     }
     switch (s->engine->support_kind) {
     case DS4_SUPPORT_DSPARK:
@@ -55652,8 +55903,17 @@ bool ds4_session_dist_frontier_snapshot(ds4_session *s,
                                         ds4_dist_mtp_frontier *f) {
     if (!f) return false;
     memset(f, 0, sizeof(*f));
-    if (!s || !s->engine || ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
+    if (!s || !s->engine || ds4_session_is_cpu(s)) {
         return false;
+    }
+    if (ds4_session_is_glm(s)) {
+        /* GLM-5.3 speculative rollback rides the mid-span KDA snapshots
+         * taken after the committed base rows (armed per span via
+         * ds4_session_glm_dist_spec_span_begin). The frontier itself is
+         * only a validity marker. */
+        if (!s->glm_graph_ready) return false;
+        f->valid = true;
+        return true;
     }
     ds4_gpu_graph *g = &s->graph;
     if (!metal_graph_dspark_cache_current_window_valid(g)) return false;
@@ -55693,9 +55953,19 @@ bool ds4_session_dist_frontier_snapshot(ds4_session *s,
 
 bool ds4_session_dist_frontier_restore(ds4_session *s,
                                        const ds4_dist_mtp_frontier *f) {
-    if (!f || !f->valid || !s || !s->engine || ds4_session_is_cpu(s) ||
-        ds4_session_is_glm(s)) {
+    if (!f || !f->valid || !s || !s->engine || ds4_session_is_cpu(s)) {
         return false;
+    }
+    if (ds4_session_is_glm(s)) {
+        if (!s->glm_graph_ready) return false;
+        ds4_glm_gpu_graph *g = &s->glm_graph;
+        bool ok = true;
+        if (g->dist_spec_saved) {
+            ok = glm53_graph_copy_kda_state(g, false);
+            g->dist_spec_saved = false;
+        }
+        g->dist_spec_base_split = 0u;
+        return ok;
     }
     ds4_gpu_graph *g = &s->graph;
     if (!metal_graph_dspark_cache_window_valid(g,
@@ -62529,13 +62799,20 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     ds4_backend_name(e->backend));
         }
     }
+    const bool include_nextn =
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+        opt->glm_mtp &&
+        opt->distributed.role == DS4_DISTRIBUTED_WORKER &&
+        opt->distributed.layers.set &&
+        opt->distributed.layers.has_output;
     weights_bind(&e->weights,
                  &e->model,
                  load_slice,
                  load_layer_start,
                  load_layer_end,
                  load_output,
-                 load_output_optional);
+                 load_output_optional,
+                 include_nextn);
 
     /* TP always maps one contiguous routed-expert half per rank. Decide
      * immediately after binding so memory guards account only the bytes this
@@ -63157,11 +63434,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
             }
 
             ds4_model_map_span_vec spans;
-            if (!weights_model_map_spans(&e->weights,
+            g_nextn_slice_include = include_nextn;
+            const bool slice_spans_ok = weights_model_map_spans(&e->weights,
                                          load_layer_start,
                                          load_layer_end,
                                          map_output,
-                                         &spans))
+                                         &spans);
+            g_nextn_slice_include = false;
+            if (!slice_spans_ok)
             {
                 fprintf(stderr, "ds4: invalid model load layer slice %u:%s\n",
                         load_layer_start,
@@ -64819,7 +65099,7 @@ static int ds4_session_glm_spec_cycle_impl(
         int d = -1;
         s->glm_mtp_have = 0;
         if (glm_graph_mtp_step(g, &e->model, &e->weights, n1, pos,
-                               s->glm_mtp_min_pos, &d)) {
+                               s->glm_mtp_min_pos, NULL, &d)) {
             s->glm_mtp_draft = d;
             s->glm_mtp_parent = n1;
             s->glm_mtp_have = 1;
@@ -64992,13 +65272,13 @@ static int ds4_session_glm_spec_cycle_impl(
             ds4_gpu_tensor_write(target_hidden, 0, s->glm_mtp_hc,
                                  hc_row_bytes) != 0 &&
             glm_graph_mtp_step(g, &e->model, &e->weights, d, pos,
-                               s->glm_mtp_min_pos, &dummy) &&
+                               s->glm_mtp_min_pos, NULL, &dummy) &&
             ds4_gpu_tensor_write(target_hidden,
                                  0,
                                  s->glm_mtp_hc + hc_row_values,
                                  hc_row_bytes) != 0 &&
             glm_graph_mtp_step(g, &e->model, &e->weights, n2, pos + 1u,
-                               s->glm_mtp_min_pos, &nd);
+                               s->glm_mtp_min_pos, NULL, &nd);
         if (cu) {
             s->glm_mtp_draft = nd;
             s->glm_mtp_parent = n2;
@@ -65058,6 +65338,7 @@ static int ds4_session_glm_spec_cycle_impl(
                                    next,
                                    pos + 1u,
                                    s->glm_mtp_min_pos,
+                                   NULL,
                                    &nd)) {
                 s->glm_mtp_draft = nd;
                 s->glm_mtp_parent = next;
@@ -65075,7 +65356,7 @@ static int ds4_session_glm_spec_cycle_impl(
                                  hc_row_bytes) != 0;
         const bool cu = !exact_sampling && hidden_ready &&
             glm_graph_mtp_step(g, &e->model, &e->weights, n1, pos,
-                               s->glm_mtp_min_pos, &nd);
+                               s->glm_mtp_min_pos, NULL, &nd);
         if (cu) {
             s->glm_mtp_draft = nd;
             s->glm_mtp_parent = n1;
@@ -65899,9 +66180,52 @@ int ds4_session_eval_layer_slice_logits_all(ds4_session *s,
     return 1;
 #else
     if (ds4_session_is_glm(s)) {
-        if (errlen) snprintf(err, errlen, "per-row layer-slice logits are not supported for GLM");
-        s->checkpoint_valid = false;
-        return 1;
+        ds4_engine *e = s->engine;
+        ds4_glm_gpu_graph *g = &s->glm_graph;
+        if (!s->glm_graph_ready) {
+            if (errlen) snprintf(err, errlen, "GLM graph is not initialized");
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        const uint64_t hc_row_values =
+            (uint64_t)DS4_N_EMBD * (g->glm53 ? DS4_N_HC : 1u);
+        const uint64_t hc_row_bytes = hc_row_values * sizeof(float);
+        float *row_hc = xmalloc((size_t)n_tokens * hc_row_values * sizeof(float));
+        if (!row_hc) {
+            if (errlen) snprintf(err, errlen, "out of memory allocating GLM per-row hidden states");
+            return 1;
+        }
+        int rc = ds4_session_eval_layer_slice(s, tokens, n_tokens, pos0,
+                                              layer_start, layer_end,
+                                              input_hc, row_hc,
+                                              false, NULL,
+                                              err, errlen);
+        if (rc != 0) {
+            free(row_hc);
+            return rc;
+        }
+        ds4_gpu_tensor *hidden_t = g->glm53 ? g->hc_cur : g->cur;
+        bool ok = true;
+        for (uint32_t r = 0; ok && r < n_tokens; r++) {
+            ok = ds4_gpu_tensor_write(hidden_t, 0,
+                                      row_hc + (uint64_t)r * hc_row_values,
+                                      hc_row_bytes) != 0 &&
+                 glm_graph_forward_output_head(g, &e->model, &e->weights,
+                                               hidden_t,
+                                               logits + (uint64_t)r * DS4_N_VOCAB);
+            /* The next row's write must not race the asynchronous head
+             * reads of this row. */
+            if (ok && r + 1u < n_tokens) ok = ds4_gpu_end_commands() != 0;
+        }
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        free(row_hc);
+        if (!ok) {
+            if (errlen) snprintf(err, errlen, "GLM per-row output head failed");
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        return 0;
     }
     if (n_tokens > s->prefill_cap) {
         if (errlen) snprintf(err, errlen, "layer-slice chunk %u exceeds prefill cap %u",
@@ -68348,7 +68672,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             if (probe_min_pos == UINT32_MAX) probe_min_pos = pos;
             int draft = -1;
             if (glm_graph_mtp_step(&s->glm_graph, &e->model, &e->weights,
-                                   nmax, pos, probe_min_pos, &draft)) {
+                                   nmax, pos, probe_min_pos, NULL,
+                                   &draft)) {
                 probe_draft = draft;
                 probe_have = 1;
             } else {

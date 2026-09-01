@@ -2866,6 +2866,10 @@ static int dist_coordinator_eval_span(
 
     const double local_t0 = profile ? dist_now_sec() : 0.0;
     int rc;
+    (void)ds4_session_glm_dist_spec_span_begin(
+            session, pos0, n_tokens,
+            (spec_flags & DS4_DIST_WORK_F_SPEC_VERIFY) != 0,
+            (spec_flags & DS4_DIST_WORK_F_SPEC_ROLLBACK) != 0);
     if (decode2_span) {
         const uint64_t hc_values = ds4_engine_hidden_f32_values(state->engine);
         rc = ds4_session_eval_layer_slice_decode2(session,
@@ -6052,7 +6056,9 @@ int ds4_dist_session_mtp_spec_cycle(
         if (fused_k > room - 2) fused_k = room - 2;
     }
     if (first_token == eos_token) fused_k = 0;
-    if (fused_k >= min_verify) {
+    const bool glm53_model = e && ds4_engine_is_glm53(e);
+    const int min_fused = glm53_model ? 1 : min_verify;
+    if (fused_k >= min_fused) {
         ds4_dist_mtp_frontier fused_frontier;
         if (!ds4_session_dist_frontier_snapshot(owner, &fused_frontier)) {
             if (errlen) snprintf(err, errlen, "coordinator speculative frontier snapshot failed");
@@ -6099,6 +6105,48 @@ int ds4_dist_session_mtp_spec_cycle(
                         frc, err && err[0] ? err : "(no detail)");
             }
             (void)ds4_session_dist_frontier_restore(owner, &fused_frontier);
+            if (glm53_model) {
+                /* GLM-5.3: roll both machines' KDA state back to the
+                 * post-base snapshot, then re-eval just the base row to
+                 * recover its logits. No full-timeline rebuild. */
+                if (!ds4_session_dist_timeline_truncate(owner, start)) {
+                    if (errlen) snprintf(err, errlen,
+                                         "GLM fused-failure timeline rewind failed");
+                    return -1;
+                }
+                float *reeval_logits = malloc((size_t)vocab * sizeof(float));
+                if (!reeval_logits) {
+                    if (errlen) snprintf(err, errlen, "out of memory allocating speculative re-eval logits");
+                    return -1;
+                }
+                const int rrc = dist_coordinator_eval_span(&d->state,
+                                                           owner,
+                                                           &d->plan,
+                                                           span_tokens,
+                                                           1,
+                                                           start,
+                                                           d->session_id,
+                                                           d->request_id++,
+                                                           false,
+                                                           DS4_DIST_WORK_F_SPEC_ROLLBACK,
+                                                           false,
+                                                           NULL,
+                                                           reeval_logits,
+                                                           NULL,
+                                                           NULL,
+                                                           err,
+                                                           errlen);
+                if (rrc != 0) {
+                    free(reeval_logits);
+                    if (errlen) snprintf(err, errlen, "GLM fused-failure rollback span failed");
+                    return -1;
+                }
+                ds4_session_set_logits(owner, reeval_logits, vocab);
+                free(reeval_logits);
+                int n_accept = 0;
+                accepted[n_accept++] = first_token;
+                return n_accept;
+            }
             int n_accept = 0;
             accepted[n_accept++] = first_token;
             DIST_MTP_SPEC_REBUILD(frc);
@@ -6114,6 +6162,14 @@ int ds4_dist_session_mtp_spec_cycle(
         for (int i = 0; i < fused_k; i++) {
             if (dist_logits_argmax(rows + (uint64_t)i * vocab, vocab) !=
                 span_tokens[i + 1]) {
+                if (getenv("DS4_MTP_SPEC_LOG") && glm53_model) {
+                    size_t al = 0, dl = 0;
+                    char *at = ds4_token_text(e, dist_logits_argmax(rows + (uint64_t)i * vocab, vocab), &al);
+                    char *dt = ds4_token_text(e, span_tokens[i + 1], &dl);
+                    fprintf(stderr,
+                            "ds4: dist mtp spec fused row %d: draft='%.*s' verify='%.*s'\n",
+                            i, (int)dl, dt ? dt : "?", (int)al, at ? at : "?");
+                }
                 break;
             }
             accept_n++;
@@ -6122,6 +6178,27 @@ int ds4_dist_session_mtp_spec_cycle(
             fprintf(stderr,
                     "ds4: dist mtp spec fused drafted=%d accepted=%d cont=%d span=%.1fms\n",
                     fused_k, accept_n, n_cont, fused_ms);
+        }
+        if (glm53_model && accept_n < fused_k) {
+            /* All-or-nothing for GLM-5.3: every KDA layer snapshotted its
+             * state right after the committed base row, so a rejected
+             * speculative suffix rolls both machines back to the post-base
+             * point without replaying anything. Keep only the base row;
+             * its logits are row 0 of the span. The worker restores its
+             * KDA state implicitly when the next span starts inside the
+             * speculative region (or via a SPEC_ROLLBACK span). */
+            (void)ds4_session_dist_frontier_restore(owner, &fused_frontier);
+            if (!ds4_session_dist_timeline_truncate(owner, start + 1u)) {
+                free(rows);
+                if (errlen) snprintf(err, errlen,
+                                     "GLM speculative timeline rewind failed");
+                return -1;
+            }
+            ds4_session_set_logits(owner, rows, vocab);
+            free(rows);
+            int n_accept = 0;
+            accepted[n_accept++] = first_token;
+            return n_accept;
         }
         if (accept_n == fused_k) {
             if (n_cont > 0 && span_tokens[fused_k] != eos_token) {
@@ -6281,6 +6358,49 @@ int ds4_dist_session_mtp_spec_cycle(
     /* The first draft must agree with the base model's own greedy choice,
      * otherwise the speculation is already wrong before any verify work. */
     if (drafts[0] != dist_logits_argmax(logits0, vocab)) {
+        if (getenv("DS4_MTP_SPEC_LOG")) {
+            size_t dl = 0, al = 0;
+            char *dt = ds4_token_text(e, drafts[0], &dl);
+            char *at = ds4_token_text(e, dist_logits_argmax(logits0, vocab), &al);
+            fprintf(stderr,
+                    "ds4: dist mtp spec first-draft mismatch draft0=%d '%.*s' argmax=%d '%.*s'\n",
+                    drafts[0], (int)dl, dt ? dt : "?",
+                    dist_logits_argmax(logits0, vocab), (int)al, at ? at : "?");
+        }
+        ds4_session_set_logits(owner, logits0, vocab);
+        free(logits0);
+        return n_accept;
+    }
+    if (glm53_model) {
+        /* GLM-5.3: always verify through the fused single-span path. Stash
+         * the proposed drafts here; the next cycle fuses [base, drafts...]
+         * into one span and rolls KDA state back to the post-base snapshot
+         * on rejection (no classic verify, no replay spans). */
+        /* drafts[0] is the proposal for start+1, which the first-draft
+         * gate just matched against the target argmax: the pending token
+         * IS drafts[0]. Verify drafts[1..] in the fused span. */
+        int stash_n = n_drafts - 1;
+        if (stash_n > draft_cap - 1) stash_n = draft_cap - 1;
+        const int room_s = ds4_session_ctx(owner) - (int)start;
+        if (stash_n > room_s - 2) stash_n = room_s - 2;
+        if (stash_n >= 1) {
+            memcpy(d->spec_pending_drafts, drafts + 1,
+                   (size_t)stash_n * sizeof(drafts[0]));
+            d->spec_pending_count = stash_n;
+            d->spec_pending_token = dist_logits_argmax(logits0, vocab);
+            d->spec_pending_pos = start + 1u;
+            if (getenv("DS4_MTP_SPEC_LOG")) {
+                size_t bt = 0, dt0 = 0;
+                char *btx = ds4_token_text(e, first_token, &bt);
+                char *d0x = ds4_token_text(e, drafts[0], &dt0);
+                fprintf(stderr,
+                        "ds4: dist mtp spec stash drafts=%d token=%d pos=%u start=%d first='%.*s' d0='%.*s'\n",
+                        stash_n, d->spec_pending_token,
+                        d->spec_pending_pos, (int)start,
+                        (int)bt, btx ? btx : "?",
+                        (int)dt0, d0x ? d0x : "?");
+            }
+        }
         ds4_session_set_logits(owner, logits0, vocab);
         free(logits0);
         return n_accept;
@@ -6296,6 +6416,22 @@ int ds4_dist_session_mtp_spec_cycle(
      * base token and keep its logits live (the worker also rejects
      * single-token verify spans). */
     if (draft_n < min_verify || draft_n < 2) {
+        if (e && ds4_engine_is_glm53(e) && n_drafts >= 1 && max_tokens > 1 &&
+            accepted_cap >= 2 && first_token != eos_token) {
+            /* GLM chained MTP: remember the proposed drafts so the next
+             * cycle fuses [base, drafts...] into a single verify span. */
+            int stash_n = n_drafts;
+            if (stash_n > draft_cap - 1) stash_n = draft_cap - 1;
+            const int room_s = ds4_session_ctx(owner) - (int)start;
+            if (stash_n > room_s - 2) stash_n = room_s - 2;
+            if (stash_n >= 1) {
+                memcpy(d->spec_pending_drafts, drafts,
+                       (size_t)stash_n * sizeof(drafts[0]));
+                d->spec_pending_count = stash_n;
+                d->spec_pending_token = dist_logits_argmax(logits0, vocab);
+                d->spec_pending_pos = start + 1u;
+            }
+        }
         ds4_session_set_logits(owner, logits0, vocab);
         free(logits0);
         return n_accept;
@@ -8400,6 +8536,12 @@ static int dist_worker_process_work_payload(
             return dist_worker_upstream_send_work_error(upstream, request_id, "worker speculative frontier snapshot failed");
         }
     }
+    /* GLM-5.3: arm per-span KDA snapshots (post-base rollback points)
+     * and roll back implicitly when a span starts inside a rejected
+     * speculative region. No-op for non-GLM sessions. */
+    (void)ds4_session_glm_dist_spec_span_begin(session->session,
+                                               work.pos0, work.n_tokens,
+                                               spec_verify, spec_rollback);
     const double eval_t0 = dist_now_sec();
     int eval_rc = spec_commit
         ? ds4_session_dist_spec_commit_prefix(session->session,
