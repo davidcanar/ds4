@@ -1,3 +1,4 @@
+#include <chrono>
 // GLM-5.x ROCm kernels.  This mirrors the Metal GLM graph entry points with
 // direct kernels first; faster Strix-specific kernels can replace these one by
 // one without changing the graph contract.
@@ -246,7 +247,36 @@ __global__ static void glm53_rocm_matvec_bf16_f32_kernel(
     const uint32_t col = blockIdx.x * 8u + warp;
     const uint32_t row = blockIdx.y;
     float sum = 0.0f;
-    if (col < out_dim) {
+    if (col < out_dim && (in_dim & 7u) == 0u) {
+        /* Vectorized path: one 128-bit load covers 8 BF16 weights per lane,
+         * 512 bytes per warp instruction. Inputs are read as two float4 per
+         * weight vector and served from L2 across the block's columns. */
+        const uint4 *wrow = (const uint4 *)(weights +
+            (uint64_t)col * in_dim);
+        const float4 *xrow = (const float4 *)(x + (uint64_t)row * in_dim);
+        const uint32_t vecs = in_dim >> 3u;
+        for (uint32_t v = lane; v < vecs; v += 32u) {
+            const uint4 w8 = wrow[v];
+            const float4 xa = xrow[v * 2u];
+            const float4 xb = xrow[v * 2u + 1u];
+            const float wa0 = __uint_as_float((w8.x & 0xFFFFu) << 16);
+            const float wa1 = __uint_as_float((w8.x >> 16) << 16);
+            const float wa2 = __uint_as_float((w8.y & 0xFFFFu) << 16);
+            const float wa3 = __uint_as_float((w8.y >> 16) << 16);
+            const float wb0 = __uint_as_float((w8.z & 0xFFFFu) << 16);
+            const float wb1 = __uint_as_float((w8.z >> 16) << 16);
+            const float wb2 = __uint_as_float((w8.w & 0xFFFFu) << 16);
+            const float wb3 = __uint_as_float((w8.w >> 16) << 16);
+            sum = fmaf(wa0, xa.x, sum);
+            sum = fmaf(wa1, xa.y, sum);
+            sum = fmaf(wa2, xa.z, sum);
+            sum = fmaf(wa3, xa.w, sum);
+            sum = fmaf(wb0, xb.x, sum);
+            sum = fmaf(wb1, xb.y, sum);
+            sum = fmaf(wb2, xb.z, sum);
+            sum = fmaf(wb3, xb.w, sum);
+        }
+    } else if (col < out_dim) {
         const uint16_t *wrow = weights + (uint64_t)col * in_dim;
         const float *xrow = x + (uint64_t)row * in_dim;
         for (uint32_t i = lane; i < in_dim; i += 32u) {
@@ -896,6 +926,13 @@ extern "C" int ds4_gpu_glm53_kda_prefill(
                  "GLM-5.3 KDA prefill prepare launch")) {
         return 0;
     }
+    if (getenv("DS4_GLM53DBG")) {
+        auto _t0 = std::chrono::steady_clock::now();
+        (void)cudaDeviceSynchronize();
+        auto _t1 = std::chrono::steady_clock::now();
+        fprintf(stderr, "GLM53DBG prep=%.3fms\n",
+                std::chrono::duration<double, std::milli>(_t1 - _t0).count());
+    }
     const dim3 recurrence_grid(n_heads, 32u, 1u);
     glm53_rocm_kda_prefill_recurrence_kernel<<<recurrence_grid, 128u>>>(
         (float *)out->ptr, (float *)recurrent_state->ptr,
@@ -906,12 +943,27 @@ extern "C" int ds4_gpu_glm53_kda_prefill(
                  "GLM-5.3 KDA prefill recurrence launch")) {
         return 0;
     }
+    if (getenv("DS4_GLM53DBG")) {
+        auto _t0 = std::chrono::steady_clock::now();
+        (void)cudaDeviceSynchronize();
+        auto _t1 = std::chrono::steady_clock::now();
+        fprintf(stderr, "GLM53DBG prep=%.3fms\n",
+                std::chrono::duration<double, std::milli>(_t1 - _t0).count());
+    }
     const dim3 output_grid(n_tokens, n_heads, 1u);
     glm53_rocm_kda_prefill_output_kernel<<<
         output_grid, GLM53_ROCM_KDA_DIM>>>(
             (float *)out->ptr, (const float *)output_gate->ptr,
             output_norm, n_heads, n_tokens, norm_eps);
-    return cuda_ok(cudaGetLastError(), "GLM-5.3 KDA prefill output launch");
+    int _kda_rc = cuda_ok(cudaGetLastError(), "GLM-5.3 KDA prefill output launch");
+    if (getenv("DS4_GLM53DBG")) {
+        auto _t0 = std::chrono::steady_clock::now();
+        (void)cudaDeviceSynchronize();
+        auto _t1 = std::chrono::steady_clock::now();
+        fprintf(stderr, "GLM53DBG out=%.3fms\n",
+                std::chrono::duration<double, std::milli>(_t1 - _t0).count());
+    }
+    return _kda_rc;
 }
 
 __global__ static void glm_kv_lora_rms_norm_kernel(
