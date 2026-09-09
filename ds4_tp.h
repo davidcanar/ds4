@@ -112,6 +112,7 @@ void ds4_tp_free(ds4_tp *tp);
 
 int ds4_tp_rank(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
+bool ds4_tp_is_odl(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);
@@ -237,6 +238,7 @@ typedef enum {
     DS4_TP_FRAME_COMMAND_ACK = 17,
     DS4_TP_FRAME_SYNC_GO = 18,
     DS4_TP_FRAME_SYNC_MULTIMODAL = 19,
+    DS4_TP_FRAME_ODL_READY = 20,   /* OdinLink data-plane barrier (0 bytes) */
 } ds4_tp_frame_type;
 
 typedef struct {
