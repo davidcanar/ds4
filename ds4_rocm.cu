@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "ds4_gpu.h"
+#include "ds4_image.h"
 
 static thread_local bool g_dspark_verify_mode;
 
@@ -175,6 +176,8 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
 #include "rocm/ds4_rocm_current_api_compat.cuh"
 
 #include "ds4_glm53_vision_gpu.cuh"
+#include "ds4_deepseek4_vision_gpu.cuh"
+#include "rocm/ds4_rocm_deepseek4_vision.cuh"
 
 #include "rocm/ds4_rocm_tp.cuh"
 
