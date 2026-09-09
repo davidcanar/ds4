@@ -385,6 +385,8 @@ extern "C" void ds4_gpu_tp_set_split_layout(uint64_t split_out_off,
 extern "C" int ds4_gpu_tp_init(uint32_t rank,
                     ds4_gpu_tensor *slab,
                     uint64_t gpu_flags_off,
+                    uint64_t /*out_off*/,
+                    uint64_t /*vec_bytes*/,
                     ds4_gpu_tp_exchange_fn fn,
                     void *ud) {
     if (!slab || !slab->host_alias || !slab->ptr) {

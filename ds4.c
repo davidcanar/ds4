@@ -50,7 +50,7 @@
 #endif
 
 /* TP context for the verify-block RDMA window (set with the gate callbacks). */
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#if !defined(DS4_NO_GPU) && (defined(__APPLE__) || defined(DS4_ROCM_BUILD))
 static ds4_tp *g_tp_block_ctx;
 #endif
 
@@ -41469,6 +41469,7 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *mtp_concat;
     ds4_gpu_tensor *mtp_selected;
     ds4_gpu_tensor *mtp_state_backup;
+    ds4_gpu_tensor *mtp_kda_backup;   /* fork: KDA-only chained-MTP backup */
     float          *mtp_logits_host;
     int             mtp_ready;
     /* GLM-5.3 distributed speculation: when armed, KDA layers process the
@@ -44253,6 +44254,22 @@ static bool glm53_graph_hc_pre_rows(
 }
 
 static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g);
+static uint64_t glm53_graph_kda_state_bytes(const ds4_glm_gpu_graph *g) {
+    if (!g || !g->glm53) return 0;
+    uint64_t total = 0;
+    for (uint32_t il = g->layer_start; il <= g->layer_end; il++) {
+        if (!ds4_glm53_layer_is_kda(il)) continue;
+        const uint64_t conv = ds4_gpu_tensor_bytes(g->layer_kda_conv_state[il]);
+        const uint64_t recurrent =
+            ds4_gpu_tensor_bytes(g->layer_kda_recurrent_state[il]);
+        if (conv > UINT64_MAX - total) return 0;
+        total += conv;
+        if (recurrent > UINT64_MAX - total) return 0;
+        total += recurrent;
+    }
+    return total;
+}
+
 static bool glm53_graph_copy_kda_state_layer(ds4_glm_gpu_graph *g,
                                              uint32_t il,
                                              bool save);
@@ -47715,6 +47732,10 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
     const uint64_t state_backup_bytes = glm53_graph_spec_state_bytes(g);
     if (g->glm53 && state_backup_bytes != 0) {
         g->mtp_state_backup = ds4_gpu_tensor_alloc(state_backup_bytes);
+    }
+    const uint64_t kda_backup_bytes = glm53_graph_kda_state_bytes(g);
+    if (g->glm53 && kda_backup_bytes != 0 && !g->mtp_kda_backup) {
+        g->mtp_kda_backup = ds4_gpu_tensor_alloc(kda_backup_bytes);
     }
     g->mtp_logits_host = malloc((size_t)DS4_N_VOCAB * sizeof(float));
     if (!g->mtp_kv_lora_cache || !g->mtp_k_rope_cache || !g->mtp_concat ||
@@ -54827,7 +54848,7 @@ struct ds4_session {
     bool tp_sync_lockstep;
 };
 
-static bool ds4_session_tp_leader(const ds4_session *s);
+bool ds4_session_tp_leader(const ds4_session *s);
 
 #ifndef DS4_NO_GPU
 static bool ds4_dspark_stats_enabled(void);

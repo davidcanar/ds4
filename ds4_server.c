@@ -12828,6 +12828,7 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
+        const int block_start = ds4_session_pos(slot->session);
         const bool can_mtp_spec =
             (!s->batched_mode || s->slot_count <= 1) &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
