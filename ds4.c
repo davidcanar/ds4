@@ -64172,8 +64172,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
             e->backend == DS4_BACKEND_CUDA &&
             !e->ssd_streaming &&
             !load_slice &&
-            !ds4_model_is_glm53() ||
-            !ds4_tp_enabled(&opt->tp); /* TP: each rank holds half the routed experts */
+            !ds4_model_is_glm53() &&
+            /* TP: each rank holds half the routed experts resident. */
+            !ds4_tp_enabled(&opt->tp);
         if (rocm_full_model_requires_streaming) {
             glm_backend_supported = false;
         }
@@ -65621,10 +65622,11 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         return 0;
     }
 #if defined(DS4_ROCM_BUILD)
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+        getenv("DS4_ROCM_GLM_TP") == NULL) {
         snprintf(err, errlen,
-                 "tensor parallelism for GLM models is not implemented on "
-                 "the ROCm backend yet (DeepSeek models only)");
+                 "tensor parallelism for GLM models on the ROCm backend is "
+                 "experimental: set DS4_ROCM_GLM_TP=1 to opt in");
         return 0;
     }
     /* Ownership-aware ROCm kernels currently cover Q4_K routed experts and
@@ -65662,7 +65664,11 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
             return 0;
         }
     }
-    if (e->weights.output && e->weights.output->type != DS4_TENSOR_Q8_0) {
+    /* GLM keeps its output head replicated and unsplit under TP (the
+     * leader computes full logits), so the ownership requirement does not
+     * apply; DeepSeek splits the head across ranks and needs Q8_0. */
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA &&
+        e->weights.output && e->weights.output->type != DS4_TENSOR_Q8_0) {
         snprintf(err, errlen,
                  "tensor parallelism on ROCm requires a Q8_0 output head");
         return 0;
@@ -66033,7 +66039,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->glm_graph.quality = e->quality;
         s->glm_graph.ssd_streaming = e->ssd_streaming;
         s->glm_graph.ssd_streaming_cold = e->ssd_streaming_cold;
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#if !defined(DS4_NO_GPU) && (defined(__APPLE__) || defined(DS4_ROCM_BUILD))
+        /* ROCm builds the same 50/50 expert split: the ownership-aware
+         * routed kernels and the slab gate machinery are shared. */
         if (e->tp.active) {
             s->glm_graph.tp_world = 2;
             s->glm_graph.tp_rank = (uint32_t)e->tp.rank;
