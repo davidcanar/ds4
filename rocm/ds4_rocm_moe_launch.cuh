@@ -825,8 +825,10 @@ static int routed_moe_launch(
         const uint32_t expert_tile_m = n_tokens <= 8u ? 4u : 8u;
         const uint32_t write_gate_up = 0u;
         const uint32_t use_p2_sorted = 0u;
+        /* q4k excluded: the sorted-path down GEMM uses the per-pair
+         * kernel writing down->ptr, so the moe_sum epilogue must run. */
         const uint32_t use_atomic_down =
-            !mxfp4_path && use_expert_tiles && n_tokens >= 128u;
+            !mxfp4_path && !q4k_path && use_expert_tiles && n_tokens >= 128u;
         const uint32_t use_gate_row2048 =
             !q4k_path && !mxfp4_path && use_expert_tiles && n_tokens >= 128u;
         const uint32_t use_down_tile16 =
@@ -1987,20 +1989,16 @@ static int routed_moe_launch(
             } else if (sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts &&
                 down_tile_total && down_tile_experts && down_tile_starts) {
                 if (q4k_path) {
-                    dim3 tgrid((out_dim + 31u) / 32u, down_tile_capacity, 1);
-                    if (expert_tile_m == 8u) {
-                        moe_down_q4K_expert_tile8_row32_kernel<<<tgrid, 256>>>(
-                            use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
-                            down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                            down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
-                            midq_blocks, out_dim, n_expert, use_atomic_down, tp_first, tp_count);
-                    } else {
-                        moe_down_q4K_expert_tile4_row32_kernel<<<tgrid, 256>>>(
-                            use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
-                            down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                            down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
-                            midq_blocks, out_dim, n_expert, use_atomic_down, tp_first, tp_count);
-                    }
+                    /* The sorted tile down kernels fault with HSA aperture
+                     * violations on gfx1151 TP runs; fall back to the proven
+                     * per-pair down kernel (same weights, same partial-sum
+                     * semantics) until the tile kernels are fixed. */
+                    dim3 pgrid((out_dim + 31u) / 32u, pair_count, 1);
+                    moe_down_q4K_qwarp32_kernel<<<pgrid, 256>>>(
+                        (float *)down->ptr, down_w, midq,
+                        (const int32_t *)selected_exec->ptr,
+                        down_expert_bytes, down_row_bytes, midq_blocks, out_dim,
+                        n_expert, tp_first, tp_count);
                 } else if (mxfp4_path) {
                     const uint32_t row_blocks = (out_dim + 31u) / 32u;
                     dim3 tgrid((row_blocks + down_row_groups - 1u) / down_row_groups, down_tile_capacity, 1);
@@ -2071,19 +2069,12 @@ static int routed_moe_launch(
                     pair_count);
             } else if (sorted_pairs) {
                 if (q4k_path) {
-                    moe_down_q4K_sorted_qwarp32_kernel<<<dgrid, 256>>>(
-                        (float *)down->ptr,
-                        down_w,
-                        midq,
-                        sorted_pairs,
+                    dim3 pgrid((out_dim + 31u) / 32u, pair_count, 1);
+                    moe_down_q4K_qwarp32_kernel<<<pgrid, 256>>>(
+                        (float *)down->ptr, down_w, midq,
                         (const int32_t *)selected_exec->ptr,
-                        down_expert_bytes,
-                        down_row_bytes,
-                        midq_blocks,
-                        out_dim,
-                        n_expert,
-                        tp_first,
-                        tp_count);
+                        down_expert_bytes, down_row_bytes, midq_blocks, out_dim,
+                        n_expert, tp_first, tp_count);
                 } else {
                     moe_down_sorted_qwarp32_kernel<<<dgrid, 256>>>(
                         (float *)down->ptr,
