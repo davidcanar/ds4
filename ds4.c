@@ -56750,6 +56750,20 @@ const ds4_tokens *ds4_session_tokens(ds4_session *s) {
     return s ? &s->checkpoint : NULL;
 }
 
+#ifdef DS4_NO_GPU
+/* CPU stub: the distributed pipeline never arms without a graph backend;
+ * ds4_distributed.c still references the entry point. */
+bool ds4_session_glm_dist_spec_span_begin(ds4_session *s, uint32_t pos0,
+                                          uint32_t rows, bool spec_verify,
+                                          bool spec_rollback) {
+    (void)pos0;
+    (void)rows;
+    (void)spec_verify;
+    (void)spec_rollback;
+    return !s || !s->engine;
+}
+#endif
+
 #ifndef DS4_NO_GPU
 static void spec_frontier_free(ds4_spec_frontier *f) {
     if (!f) return;
@@ -67539,6 +67553,22 @@ static int ds4_session_eval_layer_slice_span(
         bool output_all_logits,
         char *err,
         size_t errlen) {
+#ifdef DS4_NO_GPU
+    (void)tokens;
+    (void)n_tokens;
+    (void)pos0;
+    (void)layer_start;
+    (void)layer_end;
+    (void)input_hc;
+    (void)output_hc;
+    (void)logits;
+    (void)output_logits;
+    (void)output_all_logits;
+    if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
+    s->checkpoint_valid = false;
+    return 1;
+}
+#else
     ds4_engine *e = s->engine;
     ds4_gpu_graph *g = &s->graph;
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -67738,6 +67768,7 @@ static int ds4_session_eval_layer_slice_span(
     ds4_session_slice_commit_timeline(s, tokens, n_tokens);
     return 0;
 }
+#endif /* !DS4_NO_GPU */
 
 int ds4_session_eval_layer_slice_logits_all(ds4_session *s,
                                             const int *tokens,
