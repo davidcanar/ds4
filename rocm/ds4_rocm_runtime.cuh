@@ -274,6 +274,11 @@ struct cuda_stream_cache_layer_stats {
 };
 
 static std::vector<cuda_model_range> g_model_ranges;
+/* File spans the engine mlocked because kernels read them straight from
+ * the model mapping. Post-upload page discards must skip them:
+ * fadvise/madvise DONTNEED evicts even mlocked file pages, and the GPU
+ * cannot fault them back in. */
+static std::vector<std::pair<uint64_t, uint64_t>> g_locked_source_spans;
 static std::vector<cuda_model_arena> g_model_arenas;
 static std::vector<cuda_model_image> g_model_images;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
@@ -5337,9 +5342,27 @@ static uint64_t cuda_model_copy_chunk_bytes(void) {
     return 64ull * 1048576ull;
 }
 
+static int cuda_model_span_is_locked(uint64_t offset, uint64_t bytes) {
+    if (bytes == 0) return 1;
+    const uint64_t end = offset + bytes;
+    if (end < offset) return 0;
+    for (const auto &ls : g_locked_source_spans) {
+        const uint64_t l0 = ls.first;
+        const uint64_t l1 = ls.first + ls.second;
+        if (l1 > l0 && offset < l1 && l0 < end) return 1;
+    }
+    return 0;
+}
+
+extern "C" void ds4_gpu_add_locked_source_span(uint64_t offset, uint64_t bytes) {
+    if (bytes == 0) return;
+    g_locked_source_spans.push_back({offset, bytes});
+}
+
 static void cuda_model_discard_source_pages(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_MADV_DONTNEED)
     if (!model_map || bytes == 0 || offset > model_size) return;
+    if (cuda_model_span_is_locked(offset, bytes)) return;
     if (bytes > model_size - offset) bytes = model_size - offset;
     const long page_sz_l = sysconf(_SC_PAGESIZE);
     const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
@@ -5359,6 +5382,7 @@ static void cuda_model_discard_source_pages(const void *model_map, uint64_t mode
 static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_FADV_DONTNEED)
     if (g_model_fd < 0 || bytes == 0) return;
+    if (cuda_model_span_is_locked(offset, bytes)) return;
     (void)posix_fadvise(g_model_fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
 #else
     (void)offset;
@@ -5808,6 +5832,7 @@ static void cuda_model_range_release_ranges_only(void) {
     }
     g_model_arenas.clear();
     g_model_ranges.clear();
+    g_locked_source_spans.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
     g_model_cache_full = 0;

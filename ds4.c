@@ -64555,12 +64555,17 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
         ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
         /* Keep the weights used by every token from competing with streamed
          * experts in the file cache. These bytes are already in the model
-         * budget; munmap in model_close releases the locks. */
+         * budget; munmap in model_close releases the locks.  On Metal this
+         * is a performance guard; on ROCm it is required for correctness:
+         * the GPU cannot fault in file-backed pages, so any static weight
+         * left pageable turns into a memory-access fault the moment the
+         * page cache drops it under streaming churn. */
         if (e->ssd_streaming && !load_slice && !tp_shard &&
-            getenv("DS4_METAL_DISABLE_STREAMING_STATIC_LOCK") == NULL) {
+            getenv("DS4_METAL_DISABLE_STREAMING_STATIC_LOCK") == NULL &&
+            getenv("DS4_ROCM_DISABLE_STREAMING_STATIC_LOCK") == NULL) {
             ds4_model_map_span_vec spans;
             uint64_t static_bytes = 0;
             const uint64_t budget = ds4_streaming_manual_cache_safe_bytes(
@@ -64592,6 +64597,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         if (can_lock &&
                             mlock(e->model.map + off, (size_t)len) == 0) {
                             locked += len;
+                            ds4_gpu_add_locked_source_span(off, len);
                         } else {
                             can_lock = false;
                             failed += len;
@@ -64599,8 +64605,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         off += len;
                     }
                 }
-                fprintf(stderr, "ds4: Metal SSD static weights locked %.2f GiB"
-                        "; pageable %.2f GiB\n", locked / 1073741824.0,
+                fprintf(stderr, "ds4: %s SSD static weights locked %.2f GiB"
+                        "; pageable %.2f GiB\n",
+#if defined(DS4_ROCM_BUILD)
+                        "ROCm",
+#else
+                        "Metal",
+#endif
+                        locked / 1073741824.0,
                         failed / 1073741824.0);
                 free(spans.v);
             }

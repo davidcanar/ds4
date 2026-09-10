@@ -235,6 +235,9 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
+/* Register an mlocked model-file span whose source pages must survive
+ * the post-upload DONTNEED discards (GPU cannot fault file pages). */
+void ds4_gpu_add_locked_source_span(uint64_t offset, uint64_t bytes);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 #ifdef __APPLE__
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);
