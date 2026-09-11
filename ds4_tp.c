@@ -2186,7 +2186,9 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         }
         atomic_thread_fence(memory_order_release);
         if (!tp_rdma_window_barrier(tp, tag)) {
-            fprintf(stderr, "ds4-tp: big gate window barrier failed\n");
+            fprintf(stderr, "ds4-tp: big gate window barrier failed (the peer did not arrive within "
+                            "the gate deadline; raise DS4_TP_GATE_TIMEOUT_MS on both ranks if this "
+                            "happens at large contexts or under load)\n");
             return 0;
         }
         tag++;
@@ -2256,8 +2258,13 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                 return 0;
             }
             if (nwc == 0 && tp_now_sec() > deadline) {
-                fprintf(stderr, "ds4-tp: timeout in big gate window (%u/%u recvs, %u/%u sends, %u sent)\n",
+                fprintf(stderr, "ds4-tp: timeout in big gate window (%u/%u recvs, %u/%u sends, %u sent); "
+                                "the peer stopped sending (check its log; if this happens at large "
+                                "contexts, raise DS4_TP_GATE_TIMEOUT_MS on both ranks)\n",
                         recv_done, chunks, send_done, signaled, sent);
+                /* The window is orphaned mid-flight: without a reset the next
+                 * exchange inherits stale chunks and fails worse. */
+                (void)tp_rdma_bulk_reset(tp);
                 return 0;
             }
         }
@@ -2420,7 +2427,8 @@ static int tp_odl_recv_buf(ds4_tp *tp, void *p, uint64_t bytes,
                 deadline = tp_now_sec() + (double)deadline_ms / 1000.0;
             } else if (tp_now_sec() > deadline) {
                 fprintf(stderr,
-                        "ds4-tp: timeout waiting odl message (%llu/%llu)\n",
+                        "ds4-tp: timeout waiting odl message (%llu/%llu); if this happens at "
+                        "large contexts, raise DS4_TP_GATE_TIMEOUT_MS on both ranks\n",
                         (unsigned long long)off, (unsigned long long)bytes);
                 return 0;
             }
