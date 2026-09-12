@@ -177,6 +177,8 @@ typedef struct {
     uint64_t last_gate_seq;     /* last real decode receive consumed */
     bool recv_window_active;    /* decode recvs are queued ahead */
     int warm_failed;            /* last warm-up round failed (dead direction) */
+    int qp_rc;                  /* 1 = RC queue pairs negotiated (real NICs);
+                                 * 0 = UC (Apple thunderbolt-ibverbs driver) */
     uint32_t setup_attempt;     /* queue pair recreations so far */
     pthread_mutex_t post_lock;
     uint32_t recv_depth;        /* queue pair receive depth actually granted */
@@ -960,29 +962,35 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     struct ibv_qp_init_attr qia = {0};
     qia.send_cq = r->cq;
     qia.recv_cq = r->cq;
-    qia.qp_type = IBV_QPT_UC;
-    qia.cap.max_send_wr = 1024;
-    qia.cap.max_recv_wr = 1024;
-    qia.cap.max_send_sge = 1;
-    qia.cap.max_recv_sge = 1;
-    qia.cap.max_inline_data = 0;
-    r->qp = r->api.create_qp(r->pd, &qia);
-    if (!r->qp) {
-        qia.cap.max_send_wr = 256;
-        qia.cap.max_recv_wr = 64;
+    /* Real NICs want RC: UC silently drops a SEND that lands before the
+     * peer's recv WR is armed (no RNR retry), which stalls a bulk window
+     * with a silent completion queue.  The Apple thunderbolt driver only
+     * creates UC pairs, so probe RC first and fall back to UC. */
+    for (int ti = 0; ti < 2 && !r->qp; ti++) {
+        qia.qp_type = ti == 0 ? IBV_QPT_RC : IBV_QPT_UC;
+        qia.cap.max_send_wr = 1024;
+        qia.cap.max_recv_wr = 1024;
         r->qp = r->api.create_qp(r->pd, &qia);
+        if (!r->qp) {
+            qia.cap.max_send_wr = 256;
+            qia.cap.max_recv_wr = 64;
+            r->qp = r->api.create_qp(r->pd, &qia);
+        }
+        r->qp_rc = qia.qp_type == IBV_QPT_RC;
     }
     if (!r->qp) {
-        tp_set_err(err, errlen, "tp rdma: create_qp(UC): %s", strerror(errno));
+        tp_set_err(err, errlen, "tp rdma: create_qp(RC/UC): %s", strerror(errno));
         return 0;
     }
+    fprintf(stderr, "ds4-tp: rdma using %s queue pairs\n",
+            r->qp_rc ? "RC" : "UC");
     r->max_inline = qia.cap.max_inline_data;
     r->recv_depth = qia.cap.max_recv_wr ? qia.cap.max_recv_wr : 64u;
     r->send_depth = qia.cap.max_send_wr ? qia.cap.max_send_wr : 256u;
     if (r->recv_depth > 4096u) r->recv_depth = 4096u;
     if (r->send_depth > 4096u) r->send_depth = 4096u;
 
-    /* Second UC QP dedicated to bulk prefill exchanges.  Keeping the bulk
+    /* Second QP dedicated to bulk prefill exchanges.  Keeping the bulk
      * off the latency QP means the decode lookahead window stays armed for
      * the whole session (no drain protocol), and the bulk can post its
      * receives before the TCP barrier so no send ever races the peer's
@@ -990,7 +998,7 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     memset(&qia, 0, sizeof(qia));
     qia.send_cq = r->cq;
     qia.recv_cq = r->cq;
-    qia.qp_type = IBV_QPT_UC;
+    qia.qp_type = r->qp_rc ? IBV_QPT_RC : IBV_QPT_UC;
     qia.cap.max_send_wr = 512;
     qia.cap.max_recv_wr = 512;
     qia.cap.max_send_sge = 1;
@@ -998,12 +1006,12 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     qia.cap.max_inline_data = 0;
     r->qp2 = r->api.create_qp(r->pd, &qia);
     if (!r->qp2) {
-        tp_set_err(err, errlen, "tp rdma: create_qp(UC bulk): %s", strerror(errno));
+        tp_set_err(err, errlen, "tp rdma: create_qp(bulk): %s", strerror(errno));
         return 0;
     }
     r->qp3 = r->api.create_qp(r->pd, &qia);
     if (!r->qp3) {
-        tp_set_err(err, errlen, "tp rdma: create_qp(UC split): %s", strerror(errno));
+        tp_set_err(err, errlen, "tp rdma: create_qp(split): %s", strerror(errno));
         return 0;
     }
 
@@ -1146,7 +1154,7 @@ static int tp_rdma_recreate_qp(ds4_tp *tp, char *err, size_t errlen) {
     struct ibv_qp_init_attr qia = {0};
     qia.send_cq = r->cq;
     qia.recv_cq = r->cq;
-    qia.qp_type = IBV_QPT_UC;
+    qia.qp_type = r->qp_rc ? IBV_QPT_RC : IBV_QPT_UC;
     qia.cap.max_send_wr = 1024;
     qia.cap.max_recv_wr = 1024;
     qia.cap.max_send_sge = 1;
@@ -1257,16 +1265,33 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
         memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
         a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
         a.ah_attr.grh.hop_limit = 1;
-        if (r->api.modify_qp(qps[qi], &a,
-                IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-                IBV_QP_RQ_PSN) != 0) {
+        int rtr_mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+                       IBV_QP_DEST_QPN | IBV_QP_RQ_PSN;
+        if (r->qp_rc) {
+            /* RC RTR attributes UC does not consume. */
+            a.max_dest_rd_atomic = 1;
+            a.min_rnr_timer = 12;
+            rtr_mask |= IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+        }
+        if (r->api.modify_qp(qps[qi], &a, rtr_mask) != 0) {
             tp_set_err(err, errlen, "tp rdma: modify RTR (qp %d): %s", qi, strerror(errno));
             return 0;
         }
         memset(&a, 0, sizeof(a));
         a.qp_state = IBV_QPS_RTS;
         a.sq_psn = my_psn[qi];
-        if (r->api.modify_qp(qps[qi], &a, IBV_QP_STATE | IBV_QP_SQ_PSN) != 0) {
+        int rts_mask = IBV_QP_STATE | IBV_QP_SQ_PSN;
+        if (r->qp_rc) {
+            /* RC RTS attributes; rnr_retry=7 (infinite) closes the
+             * armed-recv race UC silently drops. */
+            a.timeout = 14;
+            a.retry_cnt = 7;
+            a.rnr_retry = 7;
+            a.max_rd_atomic = 1;
+            rts_mask |= IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
+                        IBV_QP_MAX_QP_RD_ATOMIC;
+        }
+        if (r->api.modify_qp(qps[qi], &a, rts_mask) != 0) {
             tp_set_err(err, errlen, "tp rdma: modify RTS (qp %d): %s", qi, strerror(errno));
             return 0;
         }
@@ -1903,7 +1928,7 @@ static int tp_rdma_bulk_reset(ds4_tp *tp) {
     struct ibv_qp_init_attr qia = {0};
     qia.send_cq = r->cq;
     qia.recv_cq = r->cq;
-    qia.qp_type = IBV_QPT_UC;
+    qia.qp_type = r->qp_rc ? IBV_QPT_RC : IBV_QPT_UC;
     qia.cap.max_send_wr = 512;
     qia.cap.max_recv_wr = 512;
     qia.cap.max_send_sge = 1;
@@ -1952,16 +1977,30 @@ static int tp_rdma_bulk_reset(ds4_tp *tp) {
     memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
     a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
     a.ah_attr.grh.hop_limit = 1;
-    if (r->api.modify_qp(r->qp2, &a,
-            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-            IBV_QP_RQ_PSN) != 0) {
+    int rtr_mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+                   IBV_QP_DEST_QPN | IBV_QP_RQ_PSN;
+    if (r->qp_rc) {
+        a.max_dest_rd_atomic = 1;
+        a.min_rnr_timer = 12;
+        rtr_mask |= IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+    }
+    if (r->api.modify_qp(r->qp2, &a, rtr_mask) != 0) {
         fprintf(stderr, "ds4-tp: bulk QP RTR failed: %s\n", strerror(errno));
         return 0;
     }
     memset(&a, 0, sizeof(a));
     a.qp_state = IBV_QPS_RTS;
     a.sq_psn = (uint32_t)h.bytes;
-    if (r->api.modify_qp(r->qp2, &a, IBV_QP_STATE | IBV_QP_SQ_PSN) != 0) {
+    int rts_mask = IBV_QP_STATE | IBV_QP_SQ_PSN;
+    if (r->qp_rc) {
+        a.timeout = 14;
+        a.retry_cnt = 7;
+        a.rnr_retry = 7;
+        a.max_rd_atomic = 1;
+        rts_mask |= IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
+                    IBV_QP_MAX_QP_RD_ATOMIC;
+    }
+    if (r->api.modify_qp(r->qp2, &a, rts_mask) != 0) {
         fprintf(stderr, "ds4-tp: bulk QP RTS failed: %s\n", strerror(errno));
         return 0;
     }
@@ -2262,9 +2301,29 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                                 "the peer stopped sending (check its log; if this happens at large "
                                 "contexts, raise DS4_TP_GATE_TIMEOUT_MS on both ranks)\n",
                         recv_done, chunks, send_done, signaled, sent);
-                /* The window is orphaned mid-flight: without a reset the next
-                 * exchange inherits stale chunks and fails worse. */
-                (void)tp_rdma_bulk_reset(tp);
+                if (getenv("DS4_TP_CQ_DEBUG")) {
+                    struct ibv_wc dbg_wc[64];
+                    int dbg_n = ibv_poll_cq(r->cq, 64, dbg_wc);
+                    fprintf(stderr,
+                            "ds4-tp: big gate timeout CQ dump: %d entries, recv_depth=%u "
+                            "send_depth=%u recv_window_active=%d block_active=%d "
+                            "recv_done=%llu\n",
+                            dbg_n, r->recv_depth, r->send_depth,
+                            r->recv_window_active, (int)r->block_active,
+                            (unsigned long long)r->recv_done);
+                    for (int i = 0; i < dbg_n; i++) {
+                        fprintf(stderr,
+                                "ds4-tp:   wc opcode=%u status=%u wr_id=%llu byte_len=%u\n",
+                                dbg_wc[i].opcode, dbg_wc[i].status,
+                                (unsigned long long)dbg_wc[i].wr_id,
+                                dbg_wc[i].byte_len);
+                    }
+                }
+                /* The window is orphaned mid-flight and the pair cannot run
+                 * further big-gate exchanges; recovery would need a symmetric
+                 * rebuild of the latency QP (future work).  Under RC the
+                 * transport-level retries make reaching this a true
+                 * dead-peer signal. */
                 return 0;
             }
         }
