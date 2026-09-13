@@ -218,6 +218,12 @@ int ds4_tp_recv_sync_go(ds4_tp *tp, int *stop);
  * peer blocked in a gate or ack read unblocks with an error instead of
  * waiting forever. */
 void ds4_tp_poison(ds4_tp *tp);
+int ds4_tp_wait_command_status(ds4_tp *tp, uint64_t session_id, int *status,
+                               const char *operation, char *err, size_t errlen);
+/* Both ranks call at matching prefill boundaries. Cancellation is agreed
+ * here, never sampled independently while either rank is inside a GPU gate. */
+int ds4_tp_sync_checkpoint(ds4_tp *tp, uint32_t point, int current, int total,
+                            bool requested, bool *cancelled);
 int ds4_tp_send_stop(ds4_tp *tp);
 
 /* Worker: blocks for the next mirrored command.  Frame types below; for
@@ -247,7 +253,8 @@ typedef enum {
     DS4_TP_FRAME_RDMA_POSTED = 20,
     DS4_TP_FRAME_GLM_MTP = 21,
     DS4_TP_FRAME_SYNC_GO = 22,       /* fork: mirrored-sync barrier sequence */
-    DS4_TP_FRAME_ODL_READY = 23,     /* fork: OdinLink data-plane barrier (0 bytes) */
+    DS4_TP_FRAME_SYNC_CHECKPOINT = 23, /* upstream: prefill-boundary checkpoint */
+    DS4_TP_FRAME_ODL_READY = 24,     /* fork: OdinLink data-plane barrier (0 bytes) */
 } ds4_tp_frame_type;
 
 typedef struct {
