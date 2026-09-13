@@ -989,6 +989,8 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     r->send_depth = qia.cap.max_send_wr ? qia.cap.max_send_wr : 256u;
     if (r->recv_depth > 4096u) r->recv_depth = 4096u;
     if (r->send_depth > 4096u) r->send_depth = 4096u;
+    fprintf(stderr, "ds4-tp: rdma %s QP caps: max_send_wr=%u max_recv_wr=%u\n",
+            r->qp_rc ? "RC" : "UC", r->send_depth, r->recv_depth);
 
     /* Second QP dedicated to bulk prefill exchanges.  Keeping the bulk
      * off the latency QP means the decode lookahead window stays armed for
@@ -1065,8 +1067,9 @@ static int tp_rdma_warm_up(ds4_tp *tp, char *err, size_t errlen) {
     rwr.sg_list = &rsge;
     rwr.num_sge = 1;
     struct ibv_recv_wr *bad_r = NULL;
-    if (ibv_post_recv(r->qp, &rwr, &bad_r) != 0) {
-        tp_set_err(err, errlen, "tp rdma: warm-up post_recv: %s", strerror(errno));
+    int rc = ibv_post_recv(r->qp, &rwr, &bad_r);
+    if (rc != 0) {
+        tp_set_err(err, errlen, "tp rdma: warm-up post_recv: %s", strerror(rc));
         return 0;
     }
     if (!tp_rdma_posted_barrier(tp, 0xfeedu)) {
@@ -1089,8 +1092,9 @@ static int tp_rdma_warm_up(ds4_tp *tp, char *err, size_t errlen) {
             swr.opcode = IBV_WR_SEND;
             swr.send_flags = IBV_SEND_SIGNALED;
             struct ibv_send_wr *bad_s = NULL;
-            if (ibv_post_send(r->qp, &swr, &bad_s) != 0) {
-                tp_set_err(err, errlen, "tp rdma: warm-up post_send: %s", strerror(errno));
+            int sc = ibv_post_send(r->qp, &swr, &bad_s);
+            if (sc != 0) {
+                tp_set_err(err, errlen, "tp rdma: warm-up post_send: %s", strerror(sc));
                 return 0;
             }
         }
@@ -2218,8 +2222,9 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             const uint32_t c1 = c0 + 64u < chunks ? c0 + 64u : chunks;
             r->win_rwr[c1 - 1u].next = NULL;
             struct ibv_recv_wr *bad_recv = NULL;
-            if (ibv_post_recv(r->qp, &r->win_rwr[c0], &bad_recv) != 0) {
-                fprintf(stderr, "ds4-tp: big gate post_recv(%u of %u): %s\n", c0, chunks, strerror(errno));
+            int rrc = ibv_post_recv(r->qp, &r->win_rwr[c0], &bad_recv);
+            if (rrc != 0) {
+                fprintf(stderr, "ds4-tp: big gate post_recv(%u of %u): %s\n", c0, chunks, strerror(rrc));
                 return 0;
             }
         }
@@ -2253,8 +2258,9 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                     w->next = i + 1u < n ? &r->win_swr[i + 1u] : NULL;
                 }
                 struct ibv_send_wr *bad_send = NULL;
-                if (ibv_post_send(r->qp, r->win_swr, &bad_send) != 0) {
-                    fprintf(stderr, "ds4-tp: big gate post_send(%u): %s\n", n, strerror(errno));
+                int ssc = ibv_post_send(r->qp, r->win_swr, &bad_send);
+                if (ssc != 0) {
+                    fprintf(stderr, "ds4-tp: big gate post_send(%u): %s\n", n, strerror(ssc));
                     return 0;
                 }
                 sent += n;
