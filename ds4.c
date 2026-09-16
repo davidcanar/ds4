@@ -64213,6 +64213,37 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 #endif
 }
 
+#ifndef DS4_NO_GPU
+/* TP leader: after restoring a payload into its own graph, ship the identical
+ * bytes to the worker so the mirrored session lands on the same checkpoint
+ * before the suffix sync.  fp is left at the payload end. */
+static int ds4_session_tp_ship_payload(ds4_session *s, FILE *fp, off_t payload_start,
+                                       uint64_t payload_bytes, char *err, size_t errlen) {
+    struct ds4_tp *tp = s->engine->tp.ctx;
+    if (ds4_tp_failed(tp)) {
+        payload_set_err(err, errlen, "tp: transport failed before the KV restore mirror");
+        return 1;
+    }
+    if (fseeko(fp, payload_start, SEEK_SET) != 0) {
+        payload_set_err(err, errlen, "failed to rewind the KV payload for the worker");
+        return 1;
+    }
+    char tp_err[256] = "";
+    const int ok = ds4_tp_send_kv_restore(tp, s->tp_session_id, fp, payload_bytes,
+                                          (uint32_t)s->checkpoint.len,
+                                          tp_err, sizeof(tp_err));
+    if (fseeko(fp, payload_start + (off_t)payload_bytes, SEEK_SET) != 0) {
+        payload_set_err(err, errlen, "failed to reposition the KV payload after the worker mirror");
+        return 1;
+    }
+    if (!ok) {
+        if (err && errlen) snprintf(err, errlen, "%s", tp_err[0] ? tp_err : "worker KV restore failed");
+        return 1;
+    }
+    return 0;
+}
+#endif
+
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
@@ -64221,6 +64252,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     if (s->distributed) {
         return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
     }
+    const off_t payload_start = ftello(fp);
     uint64_t remaining = payload_bytes;
     uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
@@ -64231,11 +64263,19 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         return 1;
     }
     if (s->engine && s->engine->tp.active) {
-        /* A local payload cannot restore another rank's caches. Keep the exact
-         * saved tokens, consume the payload (leaving trailers readable), and
-         * rebuild both ranks through the ordinary mirrored sync protocol. */
-        if (!ds4_session_tp_leader(s) ||
-            h[7] >= (uint32_t)s->ctx_size || h[11] != DS4_N_VOCAB) {
+        if (h[7] >= (uint32_t)s->ctx_size || h[11] != DS4_N_VOCAB) {
+            payload_set_err(err, errlen, "invalid TP checkpoint token history");
+            return 1;
+        }
+        /* GLM ranks mirror the whole attention and KDA state (only the experts
+         * are split), so each rank restores the payload directly: the leader
+         * below, and the worker from the copy the leader streams to it once
+         * its own restore succeeded (end of the GLM branch).  Other models
+         * keep the exact saved tokens, consume the payload (leaving trailers
+         * readable), and rebuild both ranks through the mirrored sync. */
+        const bool glm_direct = ds4_session_is_glm(s) && payload_start >= 0;
+        if (glm_direct) goto restore_locally;
+        if (!ds4_session_tp_leader(s)) {
             payload_set_err(err, errlen, "invalid TP checkpoint token history");
             return 1;
         }
@@ -64257,6 +64297,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         ds4_tokens_free(&tokens);
         return rc;
     }
+restore_locally:
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) return ds41_load_payload(s, fp, h, remaining, err, errlen);
 #endif
@@ -64484,6 +64525,16 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
         s->glm_dense_cache_len = g->full_kv_cache ? saved_full_live : 0;
+        if (ds4_session_tp_leader(s) &&
+            ds4_session_tp_ship_payload(s, fp, payload_start, payload_bytes,
+                                        err, errlen) != 0) {
+            /* The worker rejected or lost the payload: drop this rank's
+             * checkpoint too (mirrored INVALIDATE) so the caller rebuilds
+             * both ranks from the prompt instead of syncing a suffix onto
+             * diverged states. */
+            ds4_session_invalidate(s);
+            return 1;
+        }
         return 0;
 #endif
     }

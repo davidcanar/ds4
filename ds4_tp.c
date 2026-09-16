@@ -3667,6 +3667,13 @@ typedef struct {
 } ds4_tp_eval_command;
 
 typedef struct {
+    uint64_t session_id;
+    uint64_t payload_bytes;
+    uint32_t tokens;
+    uint32_t reserved;
+} ds4_tp_kv_restore_command;
+
+typedef struct {
     uint32_t count;
     uint32_t reserved;
 } ds4_tp_batch_command_header;
@@ -3791,6 +3798,53 @@ int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
 int ds4_tp_send_glm_kda_sync(ds4_tp *tp, uint64_t session_id) {
     return tp_send_frame(tp->control_fd, DS4_TP_FRAME_GLM_KDA_SYNC,
                          &session_id, sizeof(session_id));
+}
+
+int ds4_tp_send_kv_restore(ds4_tp *tp, uint64_t session_id, FILE *fp,
+                           uint64_t payload_bytes, uint32_t tokens,
+                           char *err, size_t errlen) {
+    if (!tp || !fp || payload_bytes == 0) {
+        tp_set_err(err, errlen, "tp: invalid KV restore request");
+        return 0;
+    }
+    if (ds4_tp_failed(tp)) {
+        tp_set_err(err, errlen, "tp: transport failed before the KV restore");
+        return 0;
+    }
+    const ds4_tp_kv_restore_command msg = { session_id, payload_bytes, tokens, 0 };
+    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_KV_RESTORE, &msg, sizeof(msg))) {
+        ds4_tp_mark_failed(tp);
+        tp_set_err(err, errlen, "tp: KV restore header send failed: %s", strerror(errno));
+        return 0;
+    }
+    /* The worker now expects exactly payload_bytes raw bytes; any failure
+     * from here on desynchronizes the control stream, so it is fatal. */
+    const size_t chunk = 8u << 20;
+    uint8_t *buf = malloc(chunk);
+    if (!buf) {
+        ds4_tp_mark_failed(tp);
+        tp_set_err(err, errlen, "tp: KV restore buffer allocation failed");
+        return 0;
+    }
+    uint64_t left = payload_bytes;
+    while (left != 0) {
+        const size_t n = left > chunk ? chunk : (size_t)left;
+        if (fread(buf, 1, n, fp) != n) {
+            free(buf);
+            ds4_tp_mark_failed(tp);
+            tp_set_err(err, errlen, "tp: KV restore payload read failed");
+            return 0;
+        }
+        if (!tp_write_full(tp->control_fd, buf, n)) {
+            free(buf);
+            ds4_tp_mark_failed(tp);
+            tp_set_err(err, errlen, "tp: KV restore payload send failed: %s", strerror(errno));
+            return 0;
+        }
+        left -= n;
+    }
+    free(buf);
+    return ds4_tp_wait_command_ack(tp, session_id, "KV restore", err, errlen);
 }
 
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos) {
@@ -4149,6 +4203,19 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
         if (bytes != sizeof(command->session_id)) { ok = 0; break; }
         memcpy(&command->session_id, payload, sizeof(command->session_id));
         break;
+    case DS4_TP_FRAME_KV_RESTORE: {
+        ds4_tp_kv_restore_command msg;
+        if (bytes != sizeof(msg)) { ok = 0; break; }
+        memcpy(&msg, payload, sizeof(msg));
+        if (msg.payload_bytes == 0 || msg.reserved != 0 || msg.tokens > INT_MAX) {
+            ok = 0;
+            break;
+        }
+        command->session_id = msg.session_id;
+        command->bytes = msg.payload_bytes;
+        command->value = (int)msg.tokens;
+        break;
+    }
     case DS4_TP_FRAME_EVAL:
     case DS4_TP_FRAME_GLM_MTP: {
         ds4_tp_eval_command msg;
@@ -4363,6 +4430,79 @@ static int tp_worker_send_logits(ds4_tp *tp, ds4_session *session,
            ds4_tp_send_logits_half(tp, logits + vhalf, vhalf);
 }
 
+/* KV_RESTORE: the leader restored a disk-cache payload into its own graph and
+ * streams the identical bytes right after the frame.  Spool them to a
+ * disk-backed temp file (the engine loader wants a seekable FILE*) and load
+ * them through the same engine path, so both ranks sit on the same checkpoint
+ * before the suffix sync.  Returns 0 when loaded, 1 when rejected (the session
+ * was invalidated and the leader rebuilds both ranks), -1 on a transport
+ * failure. */
+static int tp_worker_kv_restore(ds4_tp *tp, ds4_session *session,
+                                uint64_t payload_bytes, uint32_t tokens,
+                                char *err, size_t errlen) {
+    const char *dir = getenv("DS4_TP_KV_TMPDIR");
+    if (!dir || !dir[0]) dir = "/var/tmp";
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/ds4-tp-kv-restore.XXXXXX", dir);
+    FILE *fp = NULL;
+    const int fd = mkstemp(path);
+    if (fd >= 0) {
+        unlink(path);
+        fp = fdopen(fd, "w+b");
+        if (!fp) close(fd);
+    }
+    int status = 0;
+    if (!fp) {
+        status = 1;
+        tp_set_err(err, errlen, "tp worker: cannot spool the KV payload in %s: %s",
+                   dir, strerror(errno));
+    }
+    const size_t chunk = 8u << 20;
+    uint8_t *buf = malloc(chunk);
+    if (!buf) {
+        if (fp) fclose(fp);
+        tp_set_err(err, errlen, "tp worker: KV restore buffer allocation failed");
+        return -1;
+    }
+    uint64_t left = payload_bytes;
+    while (left != 0) {
+        const size_t n = left > chunk ? chunk : (size_t)left;
+        if (!tp_read_full(tp->control_fd, buf, n)) {
+            free(buf);
+            if (fp) fclose(fp);
+            tp_set_err(err, errlen, "tp worker: KV restore payload truncated");
+            return -1;
+        }
+        if (status == 0 && fwrite(buf, 1, n, fp) != n) {
+            status = 1;
+            tp_set_err(err, errlen, "tp worker: KV restore spool write failed: %s",
+                       strerror(errno));
+        }
+        left -= n;
+    }
+    free(buf);
+    if (status == 0 && (fflush(fp) != 0 || fseeko(fp, 0, SEEK_SET) != 0)) {
+        status = 1;
+        tp_set_err(err, errlen, "tp worker: KV restore spool rewind failed: %s",
+                   strerror(errno));
+    }
+    if (status == 0 &&
+        ds4_session_load_payload(session, fp, payload_bytes, err, errlen) != 0) {
+        status = 1;
+    }
+    if (status == 0) {
+        const ds4_tokens *live = ds4_session_tokens(session);
+        if (!live || live->len < 0 || (uint32_t)live->len != tokens) {
+            status = 1;
+            tp_set_err(err, errlen, "tp worker: KV restore token count mismatch (%d vs %u)",
+                       live ? live->len : -1, tokens);
+        }
+    }
+    if (status != 0) ds4_session_invalidate(session);
+    if (fp) fclose(fp);
+    return status;
+}
+
 int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
     char err[256] = "";
     ds4_tp_identity id = {
@@ -4509,6 +4649,25 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
                 sync_rc != 0) {
                 ds4_log(stderr, DS4_LOG_ERROR, "tp worker GLM KDA sync: %s", err);
                 rc = 1;
+            }
+        } else if (command.type == DS4_TP_FRAME_KV_RESTORE) {
+            const int restore_rc = tp_worker_kv_restore(
+                tp, session, command.bytes, (uint32_t)command.value,
+                err, sizeof(err));
+            if (restore_rc < 0) {
+                ds4_log(stderr, DS4_LOG_ERROR, "tp worker KV restore: %s", err);
+                rc = 1;
+            } else if (!ds4_tp_send_command_ack(tp, command.session_id, restore_rc)) {
+                rc = 1;
+            } else if (restore_rc != 0) {
+                ds4_log(stderr, DS4_LOG_DEFAULT,
+                        "tp worker KV restore rejected, the leader rebuilds both ranks: %s",
+                        err);
+            } else {
+                ds4_log(stderr, DS4_LOG_DEFAULT,
+                        "tp worker KV restore: %u tokens (%.1f MiB)",
+                        (unsigned)command.value,
+                        (double)command.bytes / (1024.0 * 1024.0));
             }
         } else if (command.type == DS4_TP_FRAME_VERIFY) {
             int spec_rc = ds4_session_tp_spec_cycle(session, command.tokens,

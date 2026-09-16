@@ -11407,14 +11407,13 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   bool responses_protocol) {
     if (!s || !slot) return 0;
     /* Tensor parallelism mirrors to the worker only the tokens the leader
-     * actually evaluates.  A disk-cache restore short-circuits the
-     * leader's prefill without mirroring it, so the ranks would run
-     * different prefill graphs (leader: restored suffix only; worker:
-     * full transcript) and the per-layer gate sequences diverge.  Skip
-     * restores on the TP leader until the worker can restore its own KV
-     * shard from disk; the leader then re-prefills the full transcript
-     * and mirrors it exactly. */
-    if (slot->session && ds4_session_tp_leader(slot->session)) return 0;
+     * actually evaluates.  For GLM the engine keeps both ranks aligned on a
+     * disk restore by streaming the payload to the worker inside
+     * ds4_session_load_payload, so the lookup can run.  Other models have
+     * no worker-side restore yet: skip the lookup so the leader re-prefills
+     * the full transcript and mirrors it exactly. */
+    if (slot->session && ds4_session_tp_leader(slot->session) &&
+        !ds4_engine_is_glm_dsa(s->engine)) return 0;
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     ds4_kvstore_load_result lr = {0};

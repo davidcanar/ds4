@@ -192,6 +192,14 @@ int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
 /* GLM KDA head split: ask the worker to re-gather the peer halves of a
  * session's KDA state together with the leader (acked). */
 int ds4_tp_send_glm_kda_sync(ds4_tp *tp, uint64_t session_id);
+/* Leader: after restoring a KV payload into its own graph, stream the same
+ * payload_bytes from fp (positioned at the payload start) to the worker,
+ * which loads them into its mirrored session, and wait for its ack.
+ * Returns 1 when the worker holds the checkpoint; 0 with err otherwise (the
+ * caller invalidates its own session so both ranks rebuild). */
+int ds4_tp_send_kv_restore(ds4_tp *tp, uint64_t session_id, FILE *fp,
+                           uint64_t payload_bytes, uint32_t tokens,
+                           char *err, size_t errlen);
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos);
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id);
 int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
@@ -262,6 +270,7 @@ typedef enum {
     DS4_TP_FRAME_SYNC_CHECKPOINT = 23, /* upstream: prefill-boundary checkpoint */
     DS4_TP_FRAME_ODL_READY = 24,     /* fork: OdinLink data-plane barrier (0 bytes) */
     DS4_TP_FRAME_GLM_KDA_SYNC = 25,  /* fork: re-gather the head-split KDA state (session_id) */
+    DS4_TP_FRAME_KV_RESTORE = 26,    /* fork: mirrored KV payload restore (header, then raw payload bytes) */
 } ds4_tp_frame_type;
 
 typedef struct {
@@ -270,6 +279,7 @@ typedef struct {
     uint64_t seq;
     int value;
     int limit;
+    uint64_t bytes;         /* KV_RESTORE: payload bytes that follow the frame */
     int *tokens;
     uint32_t n_tokens;
     ds4_tp_batch_item *items;
