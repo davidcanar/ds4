@@ -15742,6 +15742,10 @@ int main(int argc, char **argv) {
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+        /* Snapshots are staged as a temp file before they are copied into
+         * the cache; keep that on the cache's (disk-backed) filesystem
+         * rather than /tmp, which is RAM-backed tmpfs on many systems. */
+        if (s.kv.enabled) ds4_session_set_payload_stage_dir(cfg.kv_disk_dir);
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,

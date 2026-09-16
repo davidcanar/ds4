@@ -63553,6 +63553,13 @@ void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
     memset(payload, 0, sizeof(*payload));
 }
 
+static char *g_payload_stage_dir;
+
+void ds4_session_set_payload_stage_dir(const char *dir) {
+    free(g_payload_stage_dir);
+    g_payload_stage_dir = dir && dir[0] ? ds4_strdup(dir) : NULL;
+}
+
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen) {
     if (!out) {
@@ -63565,7 +63572,9 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
         return 1;
     }
 
-    char tmpl[] = "/tmp/ds4-session-payload.XXXXXX";
+    char tmpl[4096];
+    snprintf(tmpl, sizeof(tmpl), "%s/ds4-session-payload.XXXXXX",
+             g_payload_stage_dir ? g_payload_stage_dir : "/tmp");
     int fd = mkstemp(tmpl);
     if (fd < 0) {
         payload_set_err(err, errlen, "failed to create staged session payload");

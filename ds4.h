@@ -706,6 +706,11 @@ bool ds4_session_dist_timeline_truncate(ds4_session *s, uint32_t len);
 uint64_t ds4_session_payload_bytes(ds4_session *s);
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen);
+/* Directory for the temp file ds4_session_stage_payload writes.  The default
+ * /tmp is a RAM-backed tmpfs on many Linux systems, where a multi-GiB
+ * snapshot competes with the model for memory; ds4-server points it at the
+ * disk cache directory.  NULL restores the default. */
+void ds4_session_set_payload_stage_dir(const char *dir);
 int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
                                      FILE *fp, char *err, size_t errlen);
 void ds4_session_payload_file_free(ds4_session_payload_file *payload);
