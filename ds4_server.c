@@ -6323,11 +6323,16 @@ static void trim_const_span(const char **start, const char **end) {
     while (*end > *start && isspace((unsigned char)(*end)[-1])) (*end)--;
 }
 
+static bool tool_param_declared_string(const tool_schema_orders *orders,
+                                       const char *name, const char *key);
+static bool tool_param_value_is_json(const char *s);
+
 static bool parse_glm_generated_message_ex(const char *text,
                                            bool require_thinking_closed,
                                            char **content_out,
                                            char **reasoning_out,
-                                           tool_calls *calls) {
+                                           tool_calls *calls,
+                                           const tool_schema_orders *orders) {
     static const char tool_start[] = "<tool_call>";
     static const char tool_end[] = "</tool_call>";
     static const char arg_key_start[] = "<arg_key>";
@@ -6430,7 +6435,13 @@ static bool parse_glm_generated_message_ex(const char *text,
             char *raw_value = xstrndup(p, (size_t)(value_end - p));
             char *value = xstrdup(raw_value);
             ds4_tool_text_unescape(value, arg_value_end);
-            tool_call_json_args_add(&args, key, value, "true");
+            /* <arg_value> carries no type marker, so apply the same rule as
+             * the Qwen parser: one complete non-string JSON literal keeps its
+             * type unless the tool schema declares the parameter as a string.
+             * Everything else stays text. */
+            const bool is_string = tool_param_declared_string(orders, name, key) ||
+                                   !tool_param_value_is_json(value);
+            tool_call_json_args_add(&args, key, value, is_string ? "true" : "false");
             free(key);
             free(raw_value);
             free(value);
@@ -6468,8 +6479,9 @@ static bool parse_glm_generated_message_ex(const char *text,
 }
 
 /* A parameter value is JSON when it parses as one complete non-string JSON
- * value (object, array, number, true/false/null); anything else is text. */
-static bool qwen_param_value_is_json(const char *s) {
+ * value (object, array, number, true/false/null); anything else is text.
+ * Shared by the Qwen and GLM parsers: neither syntax marks argument types. */
+static bool tool_param_value_is_json(const char *s) {
     if (!s) return false;
     const char *p = s;
     json_ws(&p);
@@ -6505,7 +6517,7 @@ static void qwen_trim_split(char **content_out, char **reasoning_out) {
     }
 }
 
-static bool qwen_param_declared_string(const tool_schema_orders *orders,
+static bool tool_param_declared_string(const tool_schema_orders *orders,
                                        const char *name, const char *key) {
     const tool_schema_order *order = tool_schema_orders_find(orders, name);
     if (!order) return false;
@@ -6622,8 +6634,8 @@ static bool parse_qwen_generated_message_ex(const char *text,
                 return false;
             }
             char *value = qwen_strip_value_newlines(value_start, value_end);
-            const bool is_string = qwen_param_declared_string(orders, name, key) ||
-                                   !qwen_param_value_is_json(value);
+            const bool is_string = tool_param_declared_string(orders, name, key) ||
+                                   !tool_param_value_is_json(value);
             if (is_string) ds4_tool_text_unescape(value, param_end);
             tool_call_json_args_add(&args, key, value, is_string ? "true" : "false");
             free(key);
@@ -6673,15 +6685,16 @@ static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
                                                   bool require_thinking_closed,
                                                   char **content_out,
                                                   char **reasoning_out,
-                                                  tool_calls *calls) {
+                                                  tool_calls *calls,
+                                                  const tool_schema_orders *orders) {
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return parse_glm_generated_message_ex(text, require_thinking_closed,
                                               content_out, reasoning_out,
-                                              calls);
+                                              calls, orders);
     }
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return parse_qwen_generated_message_ex(text, require_thinking_closed,
-                                               content_out, reasoning_out, calls, NULL);
+                                               content_out, reasoning_out, calls, orders);
     }
     return parse_deepseek_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out,
@@ -6699,7 +6712,7 @@ static DS4_SERVER_MAYBE_UNUSED bool parse_generated_message_ex(
                                                  require_thinking_closed,
                                                  content_out,
                                                  reasoning_out,
-                                                 calls);
+                                                 calls, NULL);
 }
 
 /* Try to repair a truncated DSML block.
@@ -6796,15 +6809,12 @@ static bool parse_generated_message_for_response_for_syntax(server_model_syntax 
                                                             const tool_schema_orders *orders) {
     if (recovered_out) *recovered_out = false;
 
-    bool parsed_ok = syntax == SERVER_MODEL_SYNTAX_QWEN ?
-        parse_qwen_generated_message_ex(text, require_thinking_closed,
-                                         content_out, reasoning_out, calls, orders) :
-        parse_generated_message_ex_for_syntax(syntax,
+    bool parsed_ok = parse_generated_message_ex_for_syntax(syntax,
                                                            text ? text : "",
                                                            require_thinking_closed,
                                                            content_out,
                                                            reasoning_out,
-                                                           calls);
+                                                           calls, orders);
     if (parsed_ok) return true;
 
     free(*content_out);
@@ -12130,7 +12140,7 @@ static bool complete_tool_call_inside_thinking(server_model_syntax syntax,
     char *content = NULL, *reasoning = NULL;
     tool_calls calls = {0};
     bool complete = parse_generated_message_ex_for_syntax(syntax, start, false,
-        &content, &reasoning, &calls) && calls.len > 0;
+        &content, &reasoning, &calls, NULL) && calls.len > 0;
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
@@ -14152,7 +14162,7 @@ decode_again:
             char *test_reasoning = NULL;
             bool repair_ok = parse_generated_message_ex_for_syntax(
                 j->req.model_syntax, repaired.ptr, false,
-                &test_content, &test_reasoning, &test_calls);
+                &test_content, &test_reasoning, &test_calls, &j->req.tool_orders);
             free(test_content);
             free(test_reasoning);
             if (repair_ok && test_calls.len > 0) {
@@ -17002,7 +17012,7 @@ static void test_openai_glm_tool_stream_suppresses_raw_tool_call(void) {
     tool_calls calls = {0};
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
         SERVER_MODEL_SYNTAX_GLM, raw, false,
-        &parsed_content, &parsed_reasoning, &calls));
+        &parsed_content, &parsed_reasoning, &calls, NULL));
     TEST_ASSERT(calls.len == 1);
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_glm_tool", &st,
                                        raw, strlen(raw), &calls,
@@ -17724,7 +17734,7 @@ static void test_parse_qwen_tool_call_message(void) {
     char *reasoning = NULL;
     tool_calls calls = {0};
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_QWEN, generated, true, &content, &reasoning, &calls));
+        SERVER_MODEL_SYNTAX_QWEN, generated, true, &content, &reasoning, &calls, NULL));
     TEST_ASSERT(reasoning && !strcmp(reasoning, "need bash"));
     TEST_ASSERT(content && !strcmp(content, "OK"));
     TEST_ASSERT(calls.len == 2);
@@ -17744,7 +17754,7 @@ static void test_parse_qwen_tool_call_message(void) {
     reasoning = NULL;
     tool_calls none = {0};
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_QWEN, "still thinking about <tool_call>", true, &content, &reasoning, &none));
+        SERVER_MODEL_SYNTAX_QWEN, "still thinking about <tool_call>", true, &content, &reasoning, &none, NULL));
     TEST_ASSERT(none.len == 0);
     TEST_ASSERT(content && !strcmp(content, ""));
     free(content);
@@ -17757,7 +17767,7 @@ static void test_parse_qwen_tool_call_message(void) {
     tool_calls bad = {0};
     TEST_ASSERT(!parse_generated_message_ex_for_syntax(
         SERVER_MODEL_SYNTAX_QWEN, "x</think>\n<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</tool_call>",
-        true, &content, &reasoning, &bad));
+        true, &content, &reasoning, &bad, NULL));
     free(content);
     free(reasoning);
     tool_calls_free(&bad);
@@ -17816,7 +17826,7 @@ static void test_qwen_literal_tool_end_in_argument(void) {
         char *content = NULL, *reasoning = NULL;
         tool_calls calls = {0};
         TEST_ASSERT(!parse_generated_message_ex_for_syntax(
-            SERVER_MODEL_SYNTAX_QWEN, bad[i], false, &content, &reasoning, &calls));
+            SERVER_MODEL_SYNTAX_QWEN, bad[i], false, &content, &reasoning, &calls, NULL));
         TEST_ASSERT(calls.len == 0);
         free(content);
         free(reasoning);
@@ -17991,7 +18001,7 @@ static void test_qwen_tool_checkpoint_round_trip(void) {
     char *content = NULL, *reasoning = NULL;
     tool_calls calls = {0};
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_QWEN, generated, true, &content, &reasoning, &calls));
+        SERVER_MODEL_SYNTAX_QWEN, generated, true, &content, &reasoning, &calls, NULL));
     buf out = {0};
     buf_puts(&out, "OK");
     append_tool_calls_text_for_syntax(&out, SERVER_MODEL_SYNTAX_QWEN, &calls, NULL);
@@ -18014,7 +18024,7 @@ static void test_qwen_sampled_tool_text_after_think_renders_exactly(void) {
     chat_msg asst = {0};
     asst.role = xstrdup("assistant");
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_QWEN, generated.ptr, true, &asst.content, &asst.reasoning, &asst.calls));
+        SERVER_MODEL_SYNTAX_QWEN, generated.ptr, true, &asst.content, &asst.reasoning, &asst.calls, NULL));
     buf expected = {0};
     buf_puts(&expected, "<|im_start|>assistant\n<think>\nNeed Tokyo.\n</think>\n\n\n\n");
     buf_puts(&expected, block);
@@ -18031,7 +18041,7 @@ static void test_qwen_sampled_tool_text_after_think_renders_exactly(void) {
     chat_msg plain = {0};
     plain.role = xstrdup("assistant");
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_QWEN, block, false, &plain.content, &plain.reasoning, &plain.calls));
+        SERVER_MODEL_SYNTAX_QWEN, block, false, &plain.content, &plain.reasoning, &plain.calls, NULL));
     buf_puts(&expected, "<|im_start|>assistant\n<think>\n\n</think>\n\n");
     buf_puts(&expected, block);
     buf_puts(&expected, "<|im_end|>\n");
@@ -18051,7 +18061,7 @@ static void test_qwen_parallel_tool_calls_parse_and_replay(void) {
     char *content = NULL, *reasoning = NULL;
     tool_calls calls = {0};
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_QWEN, generated, false, &content, &reasoning, &calls));
+        SERVER_MODEL_SYNTAX_QWEN, generated, false, &content, &reasoning, &calls, NULL));
     TEST_ASSERT(calls.len == 3);
     TEST_ASSERT(!strcmp(calls.v[0].name, "get_weather") && !strcmp(calls.v[0].arguments, "{\"city\": \"Oslo\"}"));
     TEST_ASSERT(!strcmp(calls.v[1].name, "get_weather") && !strcmp(calls.v[1].arguments, "{\"city\": \"Lisbon\"}"));
@@ -18360,13 +18370,13 @@ static void test_parse_glm_tool_call_message(void) {
 
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
         SERVER_MODEL_SYNTAX_GLM, generated, true,
-        &content, &reasoning, &calls));
+        &content, &reasoning, &calls, NULL));
     TEST_ASSERT(reasoning && !strcmp(reasoning, "need bash"));
     TEST_ASSERT(content && !strcmp(content, "OK"));
     TEST_ASSERT(calls.len == 1);
     TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
     TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"echo hi\"") != NULL);
-    TEST_ASSERT(strstr(calls.v[0].arguments, "\"timeout\": \"10\"") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"timeout\": 10") != NULL);
     TEST_ASSERT(calls.raw_tool_text &&
                 !strncmp(calls.raw_tool_text, "\n\n<tool_call>bash",
                          strlen("\n\n<tool_call>bash")));
@@ -18374,6 +18384,67 @@ static void test_parse_glm_tool_call_message(void) {
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
+}
+
+/* GLM: <arg_value> has no type marker. JSON literals keep their type unless
+ * the tool schema declares the parameter as a string; tools the request did
+ * not declare fall back to the JSON heuristic. Same rule as the Qwen parser. */
+static void test_glm_arguments_follow_schema(void) {
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"read\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"filePath\":{\"type\":\"string\"},\"offset\":{\"type\":\"number\"},"
+        "\"limit\":{\"type\":\"integer\"},\"all\":{\"type\":\"boolean\"},"
+        "\"tags\":{\"type\":\"array\"}}}}");
+    const char *cases[] = {
+        "<tool_call>read"
+        "<arg_key>filePath</arg_key><arg_value>640</arg_value>"
+        "<arg_key>offset</arg_key><arg_value>640</arg_value>"
+        "<arg_key>limit</arg_key><arg_value>100</arg_value>"
+        "<arg_key>all</arg_key><arg_value>true</arg_value>"
+        "<arg_key>tags</arg_key><arg_value>[\"a\", 2]</arg_value>"
+        "</tool_call>",
+        "<tool_call>bash"
+        "<arg_key>command</arg_key><arg_value>pwd</arg_value>"
+        "<arg_key>timeout</arg_key><arg_value>10</arg_value>"
+        "</tool_call>",
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *finish = "stop";
+        char err[128] = {0};
+        char *content = NULL, *reasoning = NULL;
+        tool_calls calls = {0};
+        bool recovered = false;
+        TEST_ASSERT(parse_generated_message_for_response_for_syntax(
+            SERVER_MODEL_SYNTAX_GLM, cases[i], true, true, false, &finish,
+            err, sizeof(err), &content, &reasoning, &calls, &recovered, &orders));
+        TEST_ASSERT(!recovered && calls.len == 1);
+        if (calls.len == 1) {
+            json_args args = {0};
+            TEST_ASSERT(json_args_parse(calls.v[0].arguments, &args));
+            if (i == 0) {
+                TEST_ASSERT(args.len == 5);
+                if (args.len == 5) {
+                    TEST_ASSERT(args.v[0].is_string && !strcmp(args.v[0].value, "640"));
+                    TEST_ASSERT(!args.v[1].is_string && !strcmp(args.v[1].value, "640"));
+                    TEST_ASSERT(!args.v[2].is_string && !strcmp(args.v[2].value, "100"));
+                    TEST_ASSERT(!args.v[3].is_string && !strcmp(args.v[3].value, "true"));
+                    TEST_ASSERT(!args.v[4].is_string && !strcmp(args.v[4].value, "[\"a\",2]"));
+                }
+            } else {
+                TEST_ASSERT(args.len == 2);
+                if (args.len == 2) {
+                    TEST_ASSERT(args.v[0].is_string && !strcmp(args.v[0].value, "pwd"));
+                    TEST_ASSERT(!args.v[1].is_string && !strcmp(args.v[1].value, "10"));
+                }
+            }
+            json_args_free(&args);
+        }
+        tool_calls_free(&calls);
+        free(content);
+        free(reasoning);
+    }
+    tool_schema_orders_free(&orders);
 }
 
 static void test_dsml_parser_recovers_loose_nested_parameters(void) {
@@ -18894,7 +18965,7 @@ static void test_glm_tool_checkpoint_suffix_is_canonical(void) {
     tool_calls calls = {0};
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
         SERVER_MODEL_SYNTAX_GLM, generated, false,
-        &content, &reasoning, &calls));
+        &content, &reasoning, &calls, NULL));
     TEST_ASSERT(calls.len == 1);
 
     request r;
@@ -19734,7 +19805,7 @@ static void test_tool_control_text_inside_arguments(void) {
         tool_calls calls = {0};
         char *content = NULL, *reasoning = NULL;
         TEST_ASSERT(parse_generated_message_ex_for_syntax(tracker.model_syntax,
-            raw.ptr, true, &content, &reasoning, &calls));
+            raw.ptr, true, &content, &reasoning, &calls, NULL));
         TEST_ASSERT(calls.len == 1);
         TEST_ASSERT(reasoning && !strcmp(reasoning, "reason"));
         if (calls.len) {
@@ -19809,7 +19880,7 @@ static void test_tool_body_escape_round_trip(void) {
         append_tool_calls_text_for_syntax(&raw, syntax, &original, NULL);
         char *content = NULL, *reasoning = NULL;
         TEST_ASSERT(parse_generated_message_ex_for_syntax(syntax, raw.ptr, false,
-            &content, &reasoning, &parsed));
+            &content, &reasoning, &parsed, NULL));
         TEST_ASSERT(parsed.len == 1);
         if (parsed.len) {
             json_args args = {0};
@@ -21907,7 +21978,7 @@ static void test_deepseek41_server_tools(void) {
     append_dsml_tool_calls_text(&raw, &original, true);
     char *content = NULL, *reasoning = NULL;
     TEST_ASSERT(parse_generated_message_ex_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK41,
-                raw.ptr, true, &content, &reasoning, &parsed));
+                raw.ptr, true, &content, &reasoning, &parsed, NULL));
     TEST_ASSERT(parsed.len == 1 && content && !content[0]);
     TEST_ASSERT(reasoning && !strcmp(reasoning, "Plan."));
     if (parsed.len == 1) {
@@ -22092,6 +22163,7 @@ static void ds4_server_unit_tests_run(void) {
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_parse_glm_tool_call_message();
+    test_glm_arguments_follow_schema();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
     test_tool_parse_failure_returns_recoverable_finish();
