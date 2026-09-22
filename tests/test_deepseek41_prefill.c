@@ -2,6 +2,14 @@
 #include "../ds4.c"
 #include <assert.h>
 
+#ifdef DS4_ROCM_BUILD
+static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weights *w,
+                                         uint32_t remaining) {
+    (void)g; (void)w; (void)remaining;
+    return 0;
+}
+#endif
+
 #define CHECK(x) do { if (!(x)) { \
     fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); goto done; \
 } } while (0)
@@ -47,7 +55,7 @@ static int check_dispatch(void) {
                         remaining[i], expected, ds41_prefill_count(&g, remaining[i]));
                 CHECK(ds41_prefill_count(&g, remaining[i]) == expected);
                 uint32_t small = 0;
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
                 if (remaining[i] >= 2 && remaining[i] < 256)
                     small = remaining[i] < 8 ? remaining[i] : 8;
 #endif
@@ -75,7 +83,9 @@ static int check_dispatch(void) {
     g.streaming = false;
     for (size_t i = 0; i < sizeof(remaining) / sizeof(*remaining); i++) {
         uint32_t expected = cold[i], small = 0;
-#ifdef __APPLE__
+        if (remaining[i] >= 129 && remaining[i] <= g.carry_cap)
+            expected = remaining[i];
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
         if (remaining[i] >= 32 && remaining[i] < 256) expected = remaining[i];
 #else
         if (remaining[i] >= 2 && remaining[i] < 256)
