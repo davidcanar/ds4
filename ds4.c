@@ -43303,6 +43303,14 @@ static bool ds41_tp_batch_enabled(const ds41_gpu_graph *g) {
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC"));
 }
 
+static bool ds41_decoder_bounded_replay_enabled(const ds41_gpu_graph *g, uint32_t count) {
+    /* SSD layer sweeps still stage each decoder layer even for 128 rows, so
+     * bounded replay loses the exact path's sequential staging without
+     * avoiding its dominant I/O. Keep SSD arithmetic and throughput exact. */
+    return metal_graph_tp_env_flag("DS4_ENABLE_V41_DECODER_SWA_BOUNDED_REPLAY", false) &&
+        !g->streaming && count > 128u && g->carry_cap >= count;
+}
+
 static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) {
     /* TP batches use the bulk protocol; row-gate ablations stay token-major. */
     if (!ds41_tp_batch_enabled(g) || g->imatrix ||
