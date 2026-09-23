@@ -5678,6 +5678,11 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "ignore_eos")) {
+            if (!parse_ignore_eos_value(&p, r)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "thinking")) {
             if (!parse_thinking_control_value(&p, &thinking_enabled)) {
                 free(key);
@@ -5715,31 +5720,44 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         request_free(r);
         return false;
     }
-    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
-    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    chat_msgs msgs = {0};
-    chat_msg sys = {0};
-    sys.role = xstrdup("system");
-    sys.content = xstrdup("You are a helpful assistant");
-    chat_msgs_push(&msgs, sys);
-    chat_msg user_msg = {0};
-    user_msg.role = xstrdup("user");
-    user_msg.content = prompt;
-    prompt = NULL;
-    chat_msgs_push(&msgs, user_msg);
-    r->prompt_text = render_chat_prompt_text_for_syntax(
-        r->model_syntax, &msgs, NULL, NULL, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
-    chat_msgs_free(&msgs);
-    free(prompt);
+    if (!request_validate_ignore_eos(r, err, errlen)) {
+        completion_prompt_free(&prompt);
+        request_free(r);
+        return false;
+    }
+    r->think_mode = DS4_THINK_NONE;
+    if (!completion_prompt_build(e, vocab_size, &prompt, r,
+                                 err, errlen)) {
+        completion_prompt_free(&prompt);
+        request_free(r);
+        return false;
+    }
+    completion_prompt_free(&prompt);
     return true;
 bad:
     free(prompt);
     snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
+}
+
+static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
+                                     int ctx_size, request *r, char *err, size_t errlen) {
+    return parse_completion_request_with_vocab(
+        e, ds4_engine_vocab_size(e), body, def_tokens, ctx_size, r, err, errlen);
+}
+
+/* Raw completions have no injected no-thinking chat suffix. Thinking tags
+ * are ordinary output here; model generation stops still apply. */
+static bool request_token_is_stop(ds4_engine *e, const request *r, int token) {
+    return r->kind == REQ_COMPLETION ? ds4_token_is_stop(e, token) :
+        ds4_token_is_stop_for_think_mode(e, token, r->think_mode);
+}
+
+/* Raw completions may emit thinking tags; fixed-length decode only excludes
+ * generation stops, including in speculative drafts. */
+static ds4_think_mode request_ignore_eos_filter_mode(const request *r) {
+    return r->kind == REQ_COMPLETION ? DS4_THINK_HIGH : r->think_mode;
 }
 
 static long long wall_ms(void) {
@@ -13966,7 +13984,7 @@ decode_again:
         const int eos_token = ds4_token_eos(s->engine);
         int token = j->req.ignore_eos ?
             ds4_session_argmax_ignoring_eos(slot->session,
-                                            j->req.think_mode) :
+                                            request_ignore_eos_filter_mode(&j->req)) :
             ds4_session_sample(slot->session, temperature, top_k,
                                top_p, min_p, &rng);
         if (token < 0) {
@@ -13974,9 +13992,7 @@ decode_again:
             snprintf(err, sizeof(err), "failed to select a non-EOS token");
             break;
         }
-        if (ds4_token_is_stop_for_think_mode(s->engine,
-                                             token,
-                                             j->req.think_mode)) {
+        if (request_token_is_stop(s->engine, &j->req, token)) {
             finish = "stop";
             stop_detail = "stop token";
             stop_token = token;
@@ -13993,7 +14009,7 @@ decode_again:
             if (j->req.ignore_eos) {
                 ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
                     slot->session, token, max_tokens - completion,
-                    eos_token, j->req.think_mode,
+                    eos_token, request_ignore_eos_filter_mode(&j->req),
                     toks, (int)(sizeof(toks) / sizeof(toks[0])),
                     err, sizeof(err));
             } else {
