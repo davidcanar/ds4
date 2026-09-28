@@ -95,9 +95,29 @@ static int check_dispatch(void) {
     g.tp_world = 1;
     CHECK(ds41_prefill_count(&g, 7) == 1);
     CHECK(ds41_prefill_count(&g, 8) == 8);
-    for (size_t i = 0; i < sizeof(remaining) / sizeof(*remaining); i++)
-        CHECK(ds41_prefill_count(&g, remaining[i]) ==
-            (remaining[i] >= 8 && remaining[i] < 256 ? remaining[i] : cold[i]));
+    for (size_t i = 0; i < sizeof(remaining) / sizeof(*remaining); i++) {
+        uint32_t expected = remaining[i] >= 8 && remaining[i] < 256 ? remaining[i] : cold[i];
+        if (remaining[i] >= 129 && remaining[i] <= g.carry_cap)
+            expected = remaining[i];
+        CHECK(ds41_prefill_count(&g, remaining[i]) == expected);
+    }
+    CHECK(!ds41_decoder_bounded_replay_enabled(&g, 128));
+    CHECK(ds41_decoder_bounded_replay_enabled(&g, 129));
+    CHECK(ds41_decoder_bounded_replay_enabled(&g, g.carry_cap));
+    CHECK(!ds41_decoder_bounded_replay_enabled(&g, g.carry_cap + 1u));
+    CHECK(ds41_prefill_count(&g, 4096) == 4096);
+    ds41_draft draft = {.mh_pos0 = 100, .mh_rows = 8, .verify_rows = 3,
+        .skip_left = 5, .policy_cycles = 7, .policy_drafted = 11,
+        .policy_accepted = 4};
+    g.draft = &draft;
+    g.swa_floor = 99;
+    g.valid = false;
+    ds41_graph_reset(&g);
+    CHECK(g.swa_floor == 0 && g.pos == 0 && g.valid);
+    CHECK(draft.mh_pos0 == 0 && draft.mh_rows == 0 && draft.verify_rows == 0);
+    CHECK(draft.skip_left == 0 && draft.policy_cycles == 0 &&
+          draft.policy_drafted == 0 && draft.policy_accepted == 0);
+    g.draft = NULL;
     ds4_imatrix_collector imatrix = {0};
     g.imatrix = &imatrix;
     CHECK(ds41_prefill_count(&g, 65536) == 1);
