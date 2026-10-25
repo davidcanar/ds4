@@ -1662,6 +1662,69 @@ extern "C" int ds4_gpu_dsv41_attention_output_tp_batch(ds4_gpu_tensor *out, ds4_
     return cuda_ok(cudaGetLastError(), "V4.1 TP attention output projection");
 }
 
+typedef struct v41_tp_moe_table_cache_entry {
+    const char *gate, *up, *down;
+    uint64_t gate_expert_bytes, down_expert_bytes;
+    uint32_t rank;
+    ds4_gpu_tensor *table;
+    struct v41_tp_moe_table_cache_entry *next;
+} v41_tp_moe_table_cache_entry;
+
+static v41_tp_moe_table_cache_entry *g_v41_tp_moe_tables;
+
+/* These tables contain only pointers into the resolved weight mapping. Cache
+ * the actual addresses, not just layer offsets, so a changed model image or
+ * chunk-cache mapping gets a fresh table. Runtime cleanup drains the GPU before
+ * releasing the entries. */
+static ds4_gpu_tensor *v41_tp_moe_table_get(
+        const char *g, const char *u, const char *d,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes, uint32_t rank) {
+    constexpr uint32_t experts = 384u, owned = 192u;
+    for (v41_tp_moe_table_cache_entry *p = g_v41_tp_moe_tables; p; p = p->next) {
+        if (p->gate == g && p->up == u && p->down == d &&
+            p->gate_expert_bytes == gate_expert_bytes &&
+            p->down_expert_bytes == down_expert_bytes && p->rank == rank) {
+            return p->table;
+        }
+    }
+    const char *tables[3][experts] = {};
+    for (uint32_t i = 0; i < owned; ++i) {
+        tables[0][rank * owned + i] = g + i * gate_expert_bytes;
+        tables[1][rank * owned + i] = u + i * gate_expert_bytes;
+        tables[2][rank * owned + i] = d + i * down_expert_bytes;
+    }
+    ds4_gpu_tensor *table = ds4_gpu_tensor_alloc(sizeof(tables));
+    if (!table) return nullptr;
+    v41_tp_moe_table_cache_entry *entry =
+        (v41_tp_moe_table_cache_entry *)calloc(1, sizeof(*entry));
+    if (!entry || !ds4_gpu_tensor_write(table, 0, tables, sizeof(tables))) {
+        free(entry);
+        ds4_gpu_tensor_free(table);
+        return nullptr;
+    }
+    entry->gate = g;
+    entry->up = u;
+    entry->down = d;
+    entry->gate_expert_bytes = gate_expert_bytes;
+    entry->down_expert_bytes = down_expert_bytes;
+    entry->rank = rank;
+    entry->table = table;
+    entry->next = g_v41_tp_moe_tables;
+    g_v41_tp_moe_tables = entry;
+    return table;
+}
+
+static void v41_tp_moe_table_cache_reset(void) {
+    v41_tp_moe_table_cache_entry *p = g_v41_tp_moe_tables;
+    g_v41_tp_moe_tables = nullptr;
+    while (p) {
+        v41_tp_moe_table_cache_entry *next = p->next;
+        ds4_gpu_tensor_free(p->table);
+        free(p);
+        p = next;
+    }
+}
+
 /* Staged correctness reference. Validate global IDs before any pointer-table
  * lookup; a null table entry suppresses every unowned gate/up/down load.
  * The ordinary routed-MoE dispatch is untouched. */
@@ -1699,25 +1762,17 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
         return ds4_gpu_dsv41_moe_tp_down(out, scratch, mid, selected,
             model_map, model_size, down_offset, n_tokens, tp_rank);
     }
-    const uint32_t first = tp_rank * owned;
-    const char *g = cuda_model_range_ptr(model_map, gate_offset + first * gate_expert,
+    const char *g = cuda_model_range_ptr(model_map, gate_offset + tp_rank * owned * gate_expert,
                                         owned * gate_expert, "V4.1 TP owned gate");
-    const char *u = cuda_model_range_ptr(model_map, up_offset + first * gate_expert,
+    const char *u = cuda_model_range_ptr(model_map, up_offset + tp_rank * owned * gate_expert,
                                         owned * gate_expert, "V4.1 TP owned up");
-    const char *d = cuda_model_range_ptr(model_map, down_offset + first * down_expert,
+    const char *d = cuda_model_range_ptr(model_map, down_offset + tp_rank * owned * down_expert,
                                         owned * down_expert, "V4.1 TP owned down");
     if (!g || !u || !d) return 0;
-    const char *tables[3][experts] = {};
-    for (uint32_t i = 0; i < owned; ++i) {
-        tables[0][first+i] = g + i * gate_expert;
-        tables[1][first+i] = u + i * gate_expert;
-        tables[2][first+i] = d + i * down_expert;
-    }
-    ds4_gpu_tensor *table = ds4_gpu_tensor_alloc(sizeof(tables));
+    ds4_gpu_tensor *table = v41_tp_moe_table_get(g, u, d, gate_expert, down_expert, tp_rank);
     if (!table) return 0;
     const uint64_t mids = pairs * 2304u;
-    int ok = ds4_gpu_tensor_write(table, 0, tables, sizeof(tables)) &&
-        ds4_gpu_tensor_fill_f32(gate, 0.f, mids) &&
+    int ok = ds4_gpu_tensor_fill_f32(gate, 0.f, mids) &&
         ds4_gpu_tensor_fill_f32(up, 0.f, mids) &&
         ds4_gpu_tensor_fill_f32(mid, 0.f, mids);
     cuda_block_q8_K *xq = (cuda_block_q8_K *)scratch->ptr;
@@ -1762,10 +1817,9 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
             ok = cuda_ok(cudaGetLastError(), "V4.1 TP owned down");
         }
     }
-    /* The reference deliberately drains before releasing its pointer table.
-     * Persistent tables and a queued service follow ownership qualification. */
-    if (!ds4_gpu_synchronize()) ok = 0;
-    ds4_gpu_tensor_free(table);
+    /* The cached table stays alive until runtime cleanup. Default-stream
+     * ordering lets the following TP gate and next layer queue without a
+     * per-layer host drain. */
     return ok;
 }
 

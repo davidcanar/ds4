@@ -132,6 +132,7 @@ __device__ __constant__ static const int8_t cuda_mxfp4_values_x2[16] = {
 #include "ds4_iq2_tables_cuda.inc"
 
 static int ds4_rocm_is_gfx1151(void);
+static void v41_tp_moe_table_cache_reset(void);
 
 #include "rocm/ds4_rocm_halo_output_b_module.cuh"
 #include "rocm/ds4_rocm_halo_moe.h"
