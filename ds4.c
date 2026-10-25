@@ -3318,8 +3318,12 @@ static bool support_model_checkpoint_compatible(const ds4_model *m) {
     ds4_str family = {0}, arch = {0};
     const bool has_family = model_get_string(m, "dspark.target_architecture", &family);
     const bool has_arch = model_get_string(m, "general.architecture", &arch);
-    const bool v41 = has_family && ds4_streq(family, "deepseek41") &&
-                     has_arch && ds4_streq(arch, "deepseek41-dspark");
+    /* Older released V4.1 DSpark GGUFs identify the family only through the
+     * architecture. Prefer the explicit key when present, but do not reject
+     * those files for omitting it. */
+    const bool v41 = has_family ?
+        ds4_streq(family, "deepseek41") :
+        (has_arch && ds4_streq(arch, "deepseek41-dspark"));
     if ((DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) != v41 ||
         (has_family && !v41 && !ds4_streq(family, "deepseek4")) ||
         (has_arch && ds4_streq(arch, "deepseek41-dspark") && !v41)) {
@@ -7441,17 +7445,10 @@ static uint64_t deepseek4_vision_required_offset(
 
 static void deepseek4_vision_weights_bind(
         ds4_deepseek4_vision_weights *w,
-        const ds4_model *m,
-        const ds4_model *language_model) {
+        const ds4_model *m) {
     const bool v41 = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
     const char *revision = v41 ? "df42c109f1defefcbfcedbe7d905718a12266e40" :
                                 "e46e16bf6035c6f317eb2ac7458eb0362926d402";
-    ds4_str language_revision = {0};
-    if (v41 &&
-        model_get_string(language_model, "general.source.revision", &language_revision) &&
-        ds4_streq(language_revision, "1bae0e1088993b9b82de08f59de5be5a34e42170")) {
-        revision = "1bae0e1088993b9b82de08f59de5be5a34e42170";
-    }
     const uint32_t projection = v41 ? 5120u : 4096u;
     ds4_str arch = {0}, source_revision = {0}, variant = {0};
     if (!model_get_string(m, "general.architecture", &arch) ||
@@ -73782,7 +73779,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             e->vision_kind = DS4_VISION_QWEN4;
         } else {
             deepseek4_vision_weights_bind(
-                    &e->deepseek4_vision_weights, &e->vision_model, &e->model);
+                    &e->deepseek4_vision_weights, &e->vision_model);
             e->vision_start_token = DS4_N_VOCAB +
                                     DS4_DEEPSEEK4_IMAGE_START;
             e->vision_image_token = DS4_N_VOCAB +
