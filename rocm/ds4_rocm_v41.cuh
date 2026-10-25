@@ -1725,6 +1725,18 @@ static void v41_tp_moe_table_cache_reset(void) {
     }
 }
 
+static int v41_tp_moe_down_with_ids(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
+        const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t down_offset,
+        uint32_t n_tokens, uint32_t tp_rank, const int32_t *host_ids);
+static int v41_tp_moe_gate_up_with_ids(
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *x,
+        uint32_t n_tokens, uint32_t tp_rank, const int32_t *host_ids);
+
 /* Staged correctness reference. Validate global IDs before any pointer-table
  * lookup; a null table entry suppresses every unowned gate/up/down load.
  * The ordinary routed-MoE dispatch is untouched. */
@@ -1751,16 +1763,16 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
         return 0;
     }
     if (n_tokens >= 128u && !g_quality_mode && ds4_rocm_is_gfx1151()) {
-        if (!ds4_gpu_dsv41_moe_tp_gate_up(gate, up, model_map, model_size,
-                gate_offset, up_offset, selected, x, n_tokens, tp_rank)) return 0;
+        if (!v41_tp_moe_gate_up_with_ids(gate, up, model_map, model_size,
+                gate_offset, up_offset, selected, x, n_tokens, tp_rank, ids.data())) return 0;
         const uint64_t count = pairs * 2304u;
         moe_swiglu_weighted_f32_kernel<<<(uint32_t)((count + 255u) / 256u), 256>>>(
             (float *)mid->ptr, (const float *)gate->ptr, (const float *)up->ptr,
             (const float *)weights->ptr, count, 2304u, 10.f);
         if (!cuda_ok(cudaGetLastError(), "V4.1 TP MMQ weighted activation") ||
             !ds4_gpu_synchronize()) return 0;
-        return ds4_gpu_dsv41_moe_tp_down(out, scratch, mid, selected,
-            model_map, model_size, down_offset, n_tokens, tp_rank);
+        return v41_tp_moe_down_with_ids(out, scratch, mid, selected,
+            model_map, model_size, down_offset, n_tokens, tp_rank, ids.data());
     }
     const char *g = cuda_model_range_ptr(model_map, gate_offset + tp_rank * owned * gate_expert,
                                         owned * gate_expert, "V4.1 TP owned gate");
@@ -1825,11 +1837,11 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
 
 /* Staged ownership adapter for the unchanged qualified Q2 down dispatcher.
  * Pair order is stable within each local expert, as in its GPU sort. */
-extern "C" int ds4_gpu_dsv41_moe_tp_down(
+static int v41_tp_moe_down_with_ids(
         ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
         const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
         const void *model_map, uint64_t model_size, uint64_t down_offset,
-        uint32_t n_tokens, uint32_t tp_rank) {
+        uint32_t n_tokens, uint32_t tp_rank, const int32_t *host_ids) {
     constexpr uint64_t expert_bytes = UINT64_C(5120) * 756u;
     const uint64_t pairs = (uint64_t)n_tokens * 6u, mids = pairs * 2304u;
     if (!g_deepseek41_model || !ds4_rocm_is_gfx1151() || tp_rank > 1u ||
@@ -1838,14 +1850,18 @@ extern "C" int ds4_gpu_dsv41_moe_tp_down(
         scratch->bytes < pairs * 5120u * sizeof(float) ||
         mid->bytes < mids * sizeof(float) || selected->bytes < pairs * sizeof(int32_t) ||
         down_offset > model_size || 384u * expert_bytes > model_size - down_offset) return 0;
-    std::vector<int32_t> ids((size_t)pairs);
-    if (!ds4_gpu_tensor_read(selected, 0, ids.data(), pairs * sizeof(int32_t))) return 0;
+    std::vector<int32_t> ids;
+    if (!host_ids) {
+        ids.resize((size_t)pairs);
+        if (!ds4_gpu_tensor_read(selected, 0, ids.data(), pairs * sizeof(int32_t))) return 0;
+        host_ids = ids.data();
+    }
     for (uint32_t row = 0; row < n_tokens; ++row) {
         for (uint32_t j = 0; j < 6u; ++j) {
-            const int32_t id = ids[(size_t)row * 6u + j];
+            const int32_t id = host_ids[(size_t)row * 6u + j];
             if (id < 0 || id >= 384) return 0;
             for (uint32_t k = 0; k < j; ++k)
-                if (id == ids[(size_t)row * 6u + k]) return 0;
+                if (id == host_ids[(size_t)row * 6u + k]) return 0;
         }
     }
     const uint32_t first = tp_rank * 192u;
@@ -1858,7 +1874,7 @@ extern "C" int ds4_gpu_dsv41_moe_tp_down(
     /* Count once, then scatter in original pair order. This produces exactly
      * the old expert-major metadata without 192 full scans of the selections. */
     for (uint32_t p = 0; p < pairs; ++p) {
-        const uint32_t id = (uint32_t)ids[p];
+        const uint32_t id = (uint32_t)host_ids[p];
         if (id >= first && id < first + 192u) ++metadata[id - first];
     }
     uint32_t pos = 0, cursor[192];
@@ -1869,7 +1885,7 @@ extern "C" int ds4_gpu_dsv41_moe_tp_down(
     }
     metadata[offsets_at + 192u] = pos;
     for (uint32_t p = 0; p < pairs; ++p) {
-        const uint32_t id = (uint32_t)ids[p];
+        const uint32_t id = (uint32_t)host_ids[p];
         if (id >= first && id < first + 192u)
             metadata[pairs_at + cursor[id - first]++] = p;
     }
@@ -1897,15 +1913,24 @@ extern "C" int ds4_gpu_dsv41_moe_tp_down(
     return ok;
 }
 
+extern "C" int ds4_gpu_dsv41_moe_tp_down(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
+        const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t down_offset,
+        uint32_t n_tokens, uint32_t tp_rank) {
+    return v41_tp_moe_down_with_ids(out, scratch, mid, selected,
+        model_map, model_size, down_offset, n_tokens, tp_rank, nullptr);
+}
+
 /* Isolated bulk operator: remap owned IDs to a contiguous192-expert table.
  * INT_MAX is a nonmatching sentinel in mm_ids_helper, so no unowned expert
  * contributes an assignment. Cleared output rows remain zero for those slots. */
-extern "C" int ds4_gpu_dsv41_moe_tp_gate_up(
+static int v41_tp_moe_gate_up_with_ids(
         ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
         const void *model_map, uint64_t model_size,
         uint64_t gate_offset, uint64_t up_offset,
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *x,
-        uint32_t n_tokens, uint32_t tp_rank) {
+        uint32_t n_tokens, uint32_t tp_rank, const int32_t *host_ids) {
     constexpr uint64_t expert_bytes = UINT64_C(2304) * 1320u;
     const uint64_t pairs = (uint64_t)n_tokens * 6u;
     const uint64_t output_bytes = pairs * 2304u * sizeof(float);
@@ -1916,18 +1941,23 @@ extern "C" int ds4_gpu_dsv41_moe_tp_gate_up(
         x->bytes < (uint64_t)n_tokens * 5120u * sizeof(float) ||
         gate_offset > model_size || 384u * expert_bytes > model_size - gate_offset ||
         up_offset > model_size || 384u * expert_bytes > model_size - up_offset) return 0;
-    std::vector<int32_t> ids((size_t)pairs);
-    if (!ds4_gpu_tensor_read(selected, 0, ids.data(), pairs * sizeof(int32_t))) return 0;
+    std::vector<int32_t> ids;
+    if (!host_ids) {
+        ids.resize((size_t)pairs);
+        if (!ds4_gpu_tensor_read(selected, 0, ids.data(), pairs * sizeof(int32_t))) return 0;
+        host_ids = ids.data();
+    }
     for (uint32_t row = 0; row < n_tokens; ++row) {
         for (uint32_t j = 0; j < 6u; ++j) {
-            const int32_t id = ids[(size_t)row * 6u + j];
+            const int32_t id = host_ids[(size_t)row * 6u + j];
             if (id < 0 || id >= 384) return 0;
             for (uint32_t k = 0; k < j; ++k)
-                if (id == ids[(size_t)row * 6u + k]) return 0;
+                if (id == host_ids[(size_t)row * 6u + k]) return 0;
         }
     }
     const uint32_t first = tp_rank * 192u;
-    for (int32_t &id : ids)
+    std::vector<int32_t> local(host_ids, host_ids + pairs);
+    for (int32_t &id : local)
         id = (uint32_t)id >= first && (uint32_t)id < first + 192u ? id - first : INT_MAX;
     const char *g = cuda_model_range_ptr(model_map, gate_offset + first * expert_bytes,
                                          192u * expert_bytes, "V4.1 TP MMQ owned gate");
@@ -1936,7 +1966,7 @@ extern "C" int ds4_gpu_dsv41_moe_tp_gate_up(
     if (!g || !u) return 0;
     ds4_gpu_tensor *local_ids = ds4_gpu_tensor_alloc(pairs * sizeof(int32_t));
     if (!local_ids) return 0;
-    int ok = ds4_gpu_tensor_write(local_ids, 0, ids.data(), pairs * sizeof(int32_t)) &&
+    int ok = ds4_gpu_tensor_write(local_ids, 0, local.data(), pairs * sizeof(int32_t)) &&
         ds4_gpu_tensor_fill_f32(gate, 0.f, pairs * 2304u) &&
         ds4_gpu_tensor_fill_f32(up, 0.f, pairs * 2304u) && ds4_mmq_init(0) == 0;
     if (ok) ok = ds4_mmq_iq2_xxs_moe_pair(g, u, (const float *)x->ptr,
@@ -1945,6 +1975,16 @@ extern "C" int ds4_gpu_dsv41_moe_tp_gate_up(
     if (!ds4_gpu_synchronize()) ok = 0;
     ds4_gpu_tensor_free(local_ids);
     return ok;
+}
+
+extern "C" int ds4_gpu_dsv41_moe_tp_gate_up(
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *x,
+        uint32_t n_tokens, uint32_t tp_rank) {
+    return v41_tp_moe_gate_up_with_ids(gate, up, model_map, model_size,
+        gate_offset, up_offset, selected, x, n_tokens, tp_rank, nullptr);
 }
 
 /* Average the HC copies entering each DSpark target layer directly into the
