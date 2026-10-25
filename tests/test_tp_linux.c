@@ -105,9 +105,10 @@ static void negotiation(void) {
             int selected=tp_linux_select(a,b,ac,bc);
             assert(selected==tp_linux_select(b,a,bc,ac));
             int expected=-1;
-            if (a<=2 && b<=2 && !(a && b && a!=b)) {
+            if (a<=3 && b<=3 && !(a && b && a!=b)) {
                 unsigned requested=a?a:b, common=ac&bc;
                 if (requested) expected=(common & (1u<<requested))?(int)requested:-1;
+                else if (common&8) expected=3;
                 else if (common&2) expected=1;
                 else if (common&4) expected=2;
             }
@@ -118,7 +119,7 @@ static void negotiation(void) {
 typedef struct { ds4_tp tp; ds4_tp_identity id; int ok; char err[256]; } hello_peer;
 static void *hello(void *arg) {
     hello_peer *p=arg;
-    p->ok=tp_hello_exchange(&p->tp,&p->id,0,p->err,sizeof(p->err));
+    p->ok=tp_hello_exchange(&p->tp,&p->id,0,0,p->err,sizeof(p->err));
     return NULL;
 }
 static void handshakes(void) {
@@ -268,7 +269,7 @@ static void backend_options(void) {
 }
 
 int main(void) {
-    assert(DS4_TP_PROTOCOL_VERSION==15);
+    assert(DS4_TP_PROTOCOL_VERSION==23);
     backend_options();
     negotiation(); handshakes(); transfers(); failures(); cancellation(); checkpoint_streams();
     puts("Linux TP: negotiation, full-duplex TCP I/O, tails, canaries, generations and failures PASS");
