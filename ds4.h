@@ -123,6 +123,7 @@ typedef struct {
     int leader_port;
     ds4_tp_transport transport;
     const char *rdma_device;
+    int rdma_port;              /* Linux RoCE port; zero selects port 1 */
     int rdma_gid_index;
     bool rdma_gid_index_set;
     bool glm_token_prefill;

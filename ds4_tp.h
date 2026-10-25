@@ -108,6 +108,7 @@ bool ds4_tp_is_rdma(const ds4_tp *tp);
  * not disabled with DS4_TP_DISABLE_RDMA_MAILBOX on either rank). */
 bool ds4_tp_command_mailbox_active(const ds4_tp *tp);
 bool ds4_tp_is_odl(const ds4_tp *tp);
+const char *ds4_tp_transport_name(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 enum {
     DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT = 1u,
@@ -195,6 +196,11 @@ int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos);
  * mirroring replay EVALs; status 1 requires invalidation and full sync. */
 int ds4_tp_send_spec_restore(ds4_tp *tp, uint64_t session_id, int pos);
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id);
+/* Linux V4.1 has replicated KV. Stream a complete checkpoint to the worker
+ * without allocating another checkpoint-sized buffer. fp advances by bytes. */
+int ds4_tp_send_restore_payload(ds4_tp *tp, uint64_t session_id,
+                                FILE *fp, uint64_t bytes,
+                                char *err, size_t errlen);
 int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
                            uint32_t count);
 int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
@@ -242,12 +248,14 @@ typedef enum {
     DS4_TP_FRAME_DSPARK_DRAFT = 23,
     DS4_TP_FRAME_SPEC_RESTORE = 24,
     DS4_TP_FRAME_ODL_READY = 25,   /* OdinLink data-plane barrier (0 bytes) */
+    DS4_TP_FRAME_RESTORE_PAYLOAD = 26,
 } ds4_tp_frame_type;
 
 typedef struct {
     ds4_tp_frame_type type;
     uint64_t session_id;
     uint64_t seq;
+    uint64_t payload_bytes;
     int value;
     int limit;
     int *tokens;

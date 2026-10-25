@@ -123,6 +123,12 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_routed_moe_selected_override_n = 0;
     g_stream_selected_cache.loaded = 0;
     g_stream_batch_selected_cache.loaded = 0;
+    g_stream_free_reserve_bytes = UINT64_C(16) << 30;
+    g_deepseek41_model = false;
+}
+
+extern "C" void ds4_gpu_set_deepseek41_model(bool enabled) {
+    g_deepseek41_model = enabled;
 }
 
 extern "C" void ds4_gpu_set_glm_model(bool enabled) {
@@ -245,6 +251,38 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                                         1);
 }
 
+extern "C" int ds4_gpu_stream_expert_cache_reserve_layers(
+        const ds4_gpu_stream_expert_table *even,
+        const ds4_gpu_stream_expert_table *odd) {
+    return cuda_stream_layer_expert_cache_reserve(even, odd);
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_note_layer_consumed(
+        const ds4_gpu_stream_expert_table *table) {
+    return cuda_stream_layer_expert_cache_note_consumed(table);
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_quiesce(void) {
+    return cuda_stream_expert_cache_quiesce();
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_get_memory(
+        ds4_gpu_stream_expert_memory *out) {
+    return cuda_stream_expert_cache_get_memory(out);
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t *expert_ids,
+        const uint32_t *expert_priorities,
+        uint32_t n_experts) {
+    if (!table || !g_ssd_streaming_mode) return 0;
+    return cuda_stream_resident_seed_experts(table->model_map,
+            table->model_size, table->layer, expert_ids, expert_priorities,
+            n_experts, table->n_total_expert, table->gate_offset, table->up_offset,
+            table->down_offset, table->gate_expert_bytes, table->down_expert_bytes, 1);
+}
+
 extern "C" int ds4_gpu_stream_expert_cache_load_layer(
         const ds4_gpu_stream_expert_table *table) {
     if (!table) return 0;
@@ -257,6 +295,22 @@ extern "C" int ds4_gpu_stream_expert_cache_load_layer(
                                                table->down_offset,
                                                table->gate_expert_bytes,
                                                table->down_expert_bytes);
+}
+
+extern "C" int ds4_gpu_dsv41_stream_prepare_layer(
+        const ds4_gpu_stream_expert_table *table,
+        ds4_gpu_dsv41_stream_layer_plan *plan) {
+    return cuda_stream_v41_prepare_layer(table, plan);
+}
+
+extern "C" int ds4_gpu_dsv41_stream_load_layer(
+        const ds4_gpu_dsv41_stream_layer_plan *plan) {
+    return cuda_stream_v41_load_layer(plan);
+}
+
+extern "C" int ds4_gpu_dsv41_stream_cancel_layer(
+        const ds4_gpu_dsv41_stream_layer_plan *plan) {
+    return cuda_stream_v41_cancel_layer(plan);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_from_layer_selected(
@@ -286,8 +340,7 @@ extern "C" int ds4_gpu_stream_expert_cache_finish_pending_batch(void) {
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_release_layer_cache(void) {
-    cuda_stream_layer_expert_cache_release();
-    return 1;
+    return cuda_stream_layer_expert_cache_release();
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
@@ -319,4 +372,48 @@ extern "C" int ds4_gpu_routed_moe_set_selected_override(
     }
     g_routed_moe_selected_override_n = n_selected;
     return 1;
+}
+
+extern "C" void ds4_rocm_halo_set_model(bool enabled) {
+    const char *policy = getenv("DS4_ROCM_HALO_PREFILL");
+    g_halo_prefill_model = enabled && (!policy || strcmp(policy, "1") == 0);
+    g_halo_attention={};g_halo_rows=0;
+    g_halo_dense_scratch=nullptr;g_halo_dense_scratch_bytes=0;
+}
+
+extern "C" void ds4_rocm_halo_set_scope(uint32_t pos,uint32_t rows,uint32_t capacity,
+        uint32_t layer,bool enabled) {
+    g_halo_attention={};
+    g_halo_dense_scratch=nullptr;g_halo_dense_scratch_bytes=0;
+    g_halo_pos=pos;g_halo_rows=enabled && !g_quality_mode && !g_glm_model && !g_ssd_streaming_mode &&
+        !cuda_runtime_config()->graph_dump ? rows : 0;g_halo_capacity=capacity;g_halo_layer=layer;
+    if (g_rocblas_ready == 1 && g_halo_prefill_model && halo_prefill_scope(rows) &&
+        ds4_rocm_is_gfx1151() &&
+        g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E) {
+        int device = -1;
+        if (!cuda_ok(cudaGetDevice(&device), "Halo BLAS current device") || device != 0) return;
+        /* Prepare Tensile before Halo fixed-index frontier projections,
+         * without relying on side effects of earlier native GEMMs. This guards
+         * a possible initialization-order dependency; the previous internal
+         * BLAS error's underlying cause was not established. Keep the original
+         * solution, arithmetic and memory-reserve policy.
+         * Single-tier init binds the handle to device 0. ready=2 records normal
+         * completion of this void API; cleanup resets ready=0 with the handle.
+         * An initializer exception leaves ready=1 and propagates, never records
+         * preparation success. No separate per-model or per-device flag. */
+        rocblas_initialize();
+        g_rocblas_ready=2;
+    }
+}
+
+extern "C" void ds4_rocm_halo_set_dense_scratch(const ds4_gpu_tensor *heads) {
+    g_halo_dense_scratch=heads?heads->ptr:nullptr;
+    g_halo_dense_scratch_bytes=heads?heads->bytes:0;
+}
+
+extern "C" void ds4_rocm_halo_attention_plan(bool enabled,const void *model,uint64_t size,
+        uint64_t a,uint64_t b,uint32_t pos,uint32_t n_ctx,float base,float scale,
+        float ext,float attn,float fast,float slow) {
+    g_halo_attention={model,size,a,b,pos,n_ctx,base,scale,ext,attn,fast,slow,
+        enabled,0,nullptr,nullptr};
 }

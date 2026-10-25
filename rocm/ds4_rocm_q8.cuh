@@ -623,7 +623,7 @@ typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;
  * into LDS as f16, while each wave owns 16 output rows and computes four
  * 16-token WMMA columns.  It is opt-in from host code because it only wins once
  * the token batch is large enough to amortize the bigger tile. */
-template <uint32_t M_TILE, uint32_t WARPS>
+template <uint32_t M_TILE, uint32_t WARPS, uint32_t PAD=0>
 __launch_bounds__(WARPS * 32u, 1)
 __global__ static void matmul_q8_0_f32_batch_wmma_rowtile_kernel(
         float *out,
@@ -657,7 +657,7 @@ __global__ static void matmul_q8_0_f32_batch_wmma_rowtile_kernel(
     ds4_q8_float8_t acc2 = acc0;
     ds4_q8_float8_t acc3 = acc0;
 
-    __shared__ _Float16 lds_x[N_TILE * K_TILE];
+    __shared__ _Float16 lds_x[N_TILE * (K_TILE + PAD)];
 
     for (uint32_t bi = 0; bi < n_blocks; bi++) {
         for (uint32_t j = tid * 2u; j < N_TILE * K_TILE; j += blockDim.x * 2u) {
@@ -669,7 +669,11 @@ __global__ static void matmul_q8_0_f32_batch_wmma_rowtile_kernel(
                 const float2 f = *(const float2 *)(x + (uint64_t)tok * in_dim + bi * 32u + kk);
                 xv = __floats2half2_rn(f.x, f.y);
             }
-            *(half2 *)(lds_x + j) = xv;
+            if constexpr (PAD == 0u) {
+                *(half2 *)(lds_x + j) = xv;
+            } else {
+                *(half2 *)(lds_x + nt * (K_TILE + PAD) + kk) = xv;
+            }
         }
         __syncthreads();
 
@@ -694,7 +698,7 @@ __global__ static void matmul_q8_0_f32_batch_wmma_rowtile_kernel(
 #pragma unroll
         for (uint32_t ntile = 0; ntile < N_TILES_PER_WARP; ntile++) {
             const uint32_t nt = ntile * 16u + lane16;
-            const _Float16 *xb = lds_x + nt * K_TILE;
+            const _Float16 *xb = lds_x + nt * (K_TILE + PAD);
             const ds4_q8_half16_t b0 = *(const ds4_q8_half16_t *)(xb);
             const ds4_q8_half16_t b1 = *(const ds4_q8_half16_t *)(xb + 16u);
             if (ntile == 0u) {

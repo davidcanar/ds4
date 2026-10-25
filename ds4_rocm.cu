@@ -54,6 +54,12 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair(
     const int32_t *ids, float *out_a, float *out_b,
     int M, int K, int n_tokens, int n_experts, int n_expert_used,
     cudaStream_t stream);
+extern "C" int ds4_mmq_iq2_xxs_moe_pair_swiglu(
+    const void *W_gate, const void *W_up, const float *X_f32,
+    const int32_t *ids, const float *router_weights,
+    float *gate, float *discard, float *mid_f32, void *mid_f16,
+    int M, int K, int n_tokens, int n_experts, int n_expert_used,
+    float clamp, cudaStream_t stream);
 extern "C" int ds4_mmq_q8_0_dense_vec(
     const void *W, const float *X_f32, float *out_f32,
     int M, int N, int K, cudaStream_t stream);
@@ -81,6 +87,7 @@ struct ds4_gpu_tensor {
     void *ptr;
     uint64_t bytes;
     int owner;
+    void *host_ptr = nullptr; /* coherent host allocation or view; otherwise NULL */
 };
 
 typedef struct {
@@ -124,6 +131,12 @@ __device__ __constant__ static const int8_t cuda_mxfp4_values_x2[16] = {
 
 #include "ds4_iq2_tables_cuda.inc"
 
+static int ds4_rocm_is_gfx1151(void);
+
+#include "rocm/ds4_rocm_halo_output_b_module.cuh"
+#include "rocm/ds4_rocm_halo_moe.h"
+#include "rocm/ds4_rocm_v41_gate_up.h"
+#include "rocm/ds4_rocm_halo_q2.h"
 #include "rocm/ds4_rocm_runtime.cuh"
 
 #include "rocm/ds4_rocm_common.cuh"
@@ -133,12 +146,21 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
 }
 
 #include "rocm/ds4_rocm_q8.cuh"
+#include "rocm/ds4_rocm_halo_q8.cuh"
+#include "rocm/ds4_rocm_halo_output_a.cuh"
+#include "rocm/ds4_rocm_halo_output_a_uncached.cuh"
+#include "rocm/ds4_rocm_halo_shared_down.cuh"
 
 #include "rocm/ds4_rocm_norm_rope.cuh"
 
 #include "rocm/ds4_rocm_fp8_kv.cuh"
 
 #include "rocm/ds4_rocm_attention.cuh"
+#include "rocm/ds4_rocm_attention_gufo.cuh"
+#include "rocm/ds4_rocm_halo_static_query.cuh"
+#include "rocm/ds4_rocm_halo_hc.cuh"
+#include "rocm/ds4_rocm_halo_direct_qk.cuh"
+#include "rocm/ds4_rocm_halo_attention.cuh"
 
 #include "rocm/ds4_rocm_hc.cuh"
 
@@ -162,6 +184,7 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
 #include "rocm/ds4_rocm_router.cuh"
 
 #include "rocm/ds4_rocm_moe.cuh"
+#include "rocm/ds4_rocm_halo_q2.cuh"
 
 #include "rocm/ds4_rocm_moe_launch.cuh"
 
@@ -171,22 +194,13 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
 
 #include "rocm/ds4_rocm_current_api_compat.cuh"
 
+#include "rocm/ds4_rocm_v41.cuh"
+
 #include "ds4_glm53_vision_gpu.cuh"
 #include "ds4_deepseek4_vision_gpu.cuh"
 #include "rocm/ds4_rocm_deepseek4_vision.cuh"
-#include "ds4_deepseek41_cuda.cuh"
 
-/* Tensor-parallel gates are Metal-only; stubs keep shared graph code
- * linkable (TP option validation rejects non-Metal backends). */
-extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
-    (void)layer; (void)gate;
-    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
-    return 0;
-}
-
-extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
-    (void)fn;
-}
+#include "rocm/ds4_rocm_tp.cuh"
 
 extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
     (void)suspend;
@@ -202,24 +216,6 @@ extern "C" void ds4_gpu_tp_set_attn_head_split(int enabled) {
 
 extern "C" void ds4_gpu_model_residency_skip(int skip) {
     (void)skip;
-}
-
-extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) {
-    (void)fn;
-}
-
-extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
-                                          const ds4_gpu_tensor *out_t,
-                                          ds4_gpu_tensor *in_t,
-                                          uint64_t bytes) {
-    (void)layer; (void)rows; (void)out_t; (void)in_t; (void)bytes;
-    return 0;
-}
-
-extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
-    (void)layer; (void)rows;
-    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
-    return 0;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(

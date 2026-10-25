@@ -1004,6 +1004,9 @@ a substitute for CUDA or Metal release testing.
   alone, and stop below 3 GiB usable. Never run primitive benchmarks or builds
   beside a resident model, even if the model process is paused. Keep logs
   outside `/tmp` so a reboot does not erase the failure evidence.
+- After Flash bulk-prefill kernel changes, run `make test-halo-shapes
+  test-halo-moe-rocm`. Require full FP32/F16 equality against current MMQ
+  and intact canaries at both 2K and 4K with all three routing patterns.
 - After resident cache changes, exercise plain Flash and checkpoint-matched
   DSpark at the default context and prefill capacity. Required weights and
   session buffers must fit before optional Q8-to-FP16 expansion. Record the
@@ -1177,6 +1180,8 @@ clients.
   and streaming decode. Repeat across OpenAI chat, Responses, Anthropic, and
   completions. Abandoned work must stop at the next backend-safe boundary, and
   a valid request after each cancellation must complete normally.
+- For V4.1 concurrent serving, run `tests/test_server_batching.py --pairs 8 --workers 4 --output batching.json` with the server defaults, then repeat with `--stream --cancel-first 4` and `--same-prompt --case long-greedy`. Cover resident and SSD experts, cold and restored disk checkpoints, and a separately recorded `--mixed-prefill-quantum 2048` control. Preserve full responses and inspect actual slot overlap and chunk boundaries. Fixed-size diagnostic controls do not substitute for testing the defaults. Fixture groups named "batch" in official scoring do not test concurrent requests.
+- Set time limits from observed model loading, prefill, generation and queue duration. If a test is still progressing when its limit expires, preserve the attempt, increase or remove the inadequate limit and complete it; investigate a stalled test. Do not count partial assertions as a completed suite. For the vision-cache test, use `--timeout` and `--thinking-tokens` when the model needs more time or reasoning tokens, recording the settings and checking that answers finish normally.
 - For the repeatable chat-completions cancellation and slot-reuse gate, run
   `python3 tests/test_server_batching.py --url http://127.0.0.1:8000 --pairs 2
   --workers 4 --case short-sampled --max-tokens 12 --cancel-first 4`. Then run
@@ -1801,6 +1806,27 @@ Exclude loading. Only the first row is initial prefill; later rows are appends.
   --prompt-file speed-bench/promessi_sposi.txt --ctx-start 4096 --ctx-max 32768 \
   --step-mul 2 --ctx-alloc 36864 --gen-tokens 128 --show-output --csv RESULT.csv
 ```
+
+## DeepSeek V4.1 Flash (ROCm/gfx1151)
+
+- ROCm 10.0, Strix Halo `gfx1151`, published `DeepSeek-V4.1-Flash-Q2.gguf`. Text/vision, resident experts, SSD streaming and two-machine TCP/RoCE; Engram stays disk-backed.
+- Official scoring: 227 cases per mode, comprising the new 112-case continuation suite and previous 115-case suite. New suite: 6,923 teacher-forced targets; API probability comparisons use 6,858 aligned positions, excluding case 047's reference alignment mismatch. Lower NLL/MAE is better.
+
+| Mode | New 112 NLL | Long 12 NLL | API target-logprob MAE | API top1 agreement | Previous 115 NLL |
+|---|---:|---:|---:|---:|---:|
+| ROCm resident | 0.39578030 | 0.19736021 | 0.21899533 | 90.449% | 0.39737428 |
+| ROCm SSD | 0.39618195 | 0.19406948 | 0.21957840 | 90.478% | 0.39357626 |
+| ROCm RoCE | 0.39619718 | 0.20031244 | 0.21992302 | 90.522% | 0.39393896 |
+| CUDA SSD | 0.39251799 | 0.20265270 | 0.21669296 | 90.580% | 0.39295501 |
+
+- CUDA SSD was rerun on NVIDIA GB10 with the same published Q2. CUDA has lower aggregate NLL; ROCm has lower NLL on the 12 long cases, which cover three task families. These results do not establish a universal backend ranking.
+- Full panels precede the final vision/query-layout/TP-wait optimizations. Follow-up scoring preserves the scores exactly: all 112 resident cases for query layout, focused SSD/TCP/RoCE cases, and final combined resident/TCP/RoCE cases including a 23K prompt.
+- The official scorer uses FP32 for the query projection. Its matrix-instruction path is checked separately with full kernel outputs and native 129,280-logit vectors and 128-token continuations; all match the corresponding controls exactly.
+- Resident, SSD, TCP and RoCE serving checks cover coding/tool use, state restore/rewind, cancellation, session reuse and all 23 vision/cache cases. Final TCP/RoCE checks each complete 16 JSON replies, 16 SSE replies and four cancellations. Cross-schedule reply equality is not a promised contract; protocol/state checks pass.
+- Vision attention: 390 independent kernel checks and 63 full encoder captures across seven images preserve outputs bitwise, including boundary-size tests and the small-image fallback.
+- Shared units, Linux TCP stress tests, ROCm transport/gate reuse and injected-failure checks, and five frontend build/link/help checks pass. No fresh physical Metal or GLM regression run is claimed.
+- Exactly two machines, each fitting its assigned experts in RAM; no cluster SSD streaming. ROCm DSpark supports resident target experts on one or two machines. RoCE uses system-RAM staging. Populated 256K and long-running production endurance are unqualified.
+- Hardware, native performance and commands: [single-node SSD](docs/STRIX_HALO.md#deepseek-v41-flash), [TCP/RoCE](docs/CLUSTERING_ROCM.md#measured-performance).
 
 ### CUDA SSD Streaming
 

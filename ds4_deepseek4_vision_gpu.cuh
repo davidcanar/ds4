@@ -125,6 +125,78 @@ __global__ static void deepseek4_vision_swiglu_split_kernel(
             (gate / (1.0f + expf(-gate))) * up);
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+template<unsigned WAVES>
+__global__ static void deepseek41_vision_attention_wave_kernel(
+        float       *out,
+        const float *q,
+        const float *k,
+        const float *v,
+        uint32_t     rows) {
+    const uint32_t row = blockIdx.x * WAVES + threadIdx.x / 32u;
+    const uint32_t head = blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= rows || head >= 16u || lane >= 32u) return;
+    const uint64_t base = (uint64_t)row * 1024u +
+                          (uint64_t)head * 64u;
+    const float q0 = q[base + lane];
+    const float q1 = q[base + lane + 32u];
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float max_score = -INFINITY;
+    float denom = 0.0f;
+    for (uint32_t key_row = 0; key_row < rows; key_row++) {
+        const uint64_t kb = (uint64_t)key_row * 1024u +
+                            (uint64_t)head * 64u;
+        float dot = q0 * k[kb + lane] + q1 * k[kb + lane + 32u];
+        for (uint32_t stride = 16u; stride != 0u; stride >>= 1u) {
+            const float next = __shfl_down(dot, stride, 32);
+            if (lane < stride) dot += next;
+        }
+        const float score = __shfl(dot, 0, 32) * 0.125f;
+        const float next_max = fmaxf(max_score, score);
+        const float old_scale = key_row == 0u ? 0.0f :
+                                expf(max_score - next_max);
+        const float new_scale = expf(score - next_max);
+        denom = denom * old_scale + new_scale;
+        acc0 = acc0 * old_scale + new_scale * v[kb + lane];
+        acc1 = acc1 * old_scale + new_scale * v[kb + lane + 32u];
+        max_score = next_max;
+    }
+    out[base + lane] = acc0 / denom;
+    out[base + lane + 32u] = acc1 / denom;
+}
+
+/* V4.1 rounds the biased attention projection before adding the residual. */
+__global__ static void deepseek41_vision_bias_residual_kernel(
+        float          *x,
+        const uint16_t *bias,
+        const float    *residual,
+        uint64_t        count,
+        uint32_t        width) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float projected = deepseek4_vision_round_bf16_dev(
+            x[i] + glm53_vision_bf16(bias + i % width));
+    x[i] = deepseek4_vision_round_bf16_dev(projected + residual[i]);
+}
+
+__global__ static void deepseek41_vision_swiglu_split_kernel(
+        float       *out,
+        const float *gate_up,
+        uint64_t     count,
+        uint32_t     width) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t d = i % width;
+    const uint64_t source = (i / width) * width * 2u + d;
+    const float gate = gate_up[source];
+    const float activated = deepseek4_vision_round_bf16_dev(
+            gate / (1.0f + expf(-gate)));
+    out[i] = deepseek4_vision_round_bf16_dev(activated * gate_up[source + width]);
+}
+#endif
+
 __global__ static void deepseek4_vision_add_residual_kernel(
         float       *x,
         const float *residual,
@@ -195,6 +267,24 @@ extern "C" int ds4_gpu_deepseek4_vision_encode(
         const ds4_deepseek4_vision_weights *weights) {
     if (!out || !patches || !model_map || !weights || grid_h == 0u ||
         grid_w == 0u || grid_h > UINT32_MAX / grid_w) return 0;
+#ifdef __HIP_PLATFORM_AMD__
+    /* ROCm includes the public weights struct, including projection_dim. CUDA
+     * retains the older4096-wide encoder and its historical private layout. */
+    const uint32_t projection = weights->projection_dim ? weights->projection_dim : 4096u;
+    if (projection != 4096u && projection != 5120u) return 0;
+    if (projection == 5120u) {
+        const uint64_t llm_h = ((uint64_t)grid_h + 2u) / 3u;
+        const uint64_t llm_w = ((uint64_t)grid_w + 2u) / 3u;
+        if (llm_h * (llm_w + 1u) + 2u > 1024u) return 0;
+    }
+#endif
+#ifdef __HIP_PLATFORM_AMD__
+#define DS4_VISION_PROJECTION projection
+#define DS4_VISION_ALIGNED aligned_projection
+#else
+#define DS4_VISION_PROJECTION 4096u
+#define DS4_VISION_ALIGNED aligned4096
+#endif
     const uint32_t rows = grid_h * grid_w;
     const uint32_t aligned_rows =
         ((grid_h + 2u) / 3u) * ((grid_w + 2u) / 3u);
@@ -202,7 +292,7 @@ extern "C" int ds4_gpu_deepseek4_vision_encode(
     const uint64_t row2816 = (uint64_t)rows * 2816u;
     const uint64_t row3072 = (uint64_t)rows * 3072u;
     const uint64_t row5632 = (uint64_t)rows * 5632u;
-    const uint64_t aligned4096 = (uint64_t)aligned_rows * 4096u;
+    const uint64_t DS4_VISION_ALIGNED = (uint64_t)aligned_rows * DS4_VISION_PROJECTION;
     const uint64_t aligned9216 = (uint64_t)aligned_rows * 9216u;
     if (row5632 > SIZE_MAX / sizeof(float) ||
         aligned9216 > SIZE_MAX / sizeof(float)) return 0;
@@ -229,13 +319,18 @@ extern "C" int ds4_gpu_deepseek4_vision_encode(
     DSV4_VISION_ALLOC(mlp_w1, row5632);
     DSV4_VISION_ALLOC(mlp_mid, row2816);
     DSV4_VISION_ALLOC(align_in, aligned9216);
-    DSV4_VISION_ALLOC(align_a, aligned4096);
-    DSV4_VISION_ALLOC(align_b, aligned4096);
+    DSV4_VISION_ALLOC(align_a, DS4_VISION_ALIGNED);
+    DSV4_VISION_ALLOC(align_b, DS4_VISION_ALIGNED);
 #undef DSV4_VISION_ALLOC
     if (!ds4_gpu_tensor_write(
             patch, 0, patches,
             (uint64_t)rows * 588u * sizeof(float)) ||
         !ds4_gpu_begin_commands()) goto cleanup;
+#ifdef __HIP_PLATFORM_AMD__
+    ok = DS4_VISION_PROJECTION != 5120u || deepseek4_vision_round_tensor(
+            patch, (uint64_t)rows * 588u, "V4.1 vision patch input round");
+    if (ok)
+#endif
     ok = ds4_gpu_glm53_matmul_bf16(
             a, model_map, model_size, weights->patch_weight,
             588u, 1024u, patch, rows);
@@ -288,11 +383,23 @@ extern "C" int ds4_gpu_deepseek4_vision_encode(
             ok = glm53_vision_launch_ok("DeepSeek vision QKV");
         }
         if (ok) {
+#ifdef __HIP_PLATFORM_AMD__
+            if (DS4_VISION_PROJECTION == 5120u && rows >= 4096u &&
+                ds4_rocm_is_gfx1151()) {
+                deepseek41_vision_attention_wave_kernel<8><<<
+                    dim3((rows + 7u) / 8u, 16u, 1u), 256u, 0,
+                    DS4_DEEPSEEK4_VISION_STREAM>>>(
+                        (float *)attn->ptr, (const float *)q->ptr,
+                        (const float *)k->ptr, (const float *)v->ptr, rows);
+            } else
+#endif
+            {
             glm53_vision_attention_kernel<<<
                 dim3(rows, 16u, 1u), 32u, 0,
                 DS4_DEEPSEEK4_VISION_STREAM>>>(
                     (float *)attn->ptr, (const float *)q->ptr,
                     (const float *)k->ptr, (const float *)v->ptr, rows);
+            }
             ok = glm53_vision_launch_ok("DeepSeek vision attention");
         }
         if (ok) ok = deepseek4_vision_round_tensor(
@@ -307,6 +414,15 @@ extern "C" int ds4_gpu_deepseek4_vision_encode(
             if (!bias) ok = 0;
         }
         if (ok) {
+#ifdef __HIP_PLATFORM_AMD__
+            if (DS4_VISION_PROJECTION == 5120u) {
+                deepseek41_vision_bias_residual_kernel<<<
+                    (unsigned)((row1024 + 255u) / 256u), 256u, 0,
+                    DS4_DEEPSEEK4_VISION_STREAM>>>(
+                        (float *)tmp->ptr, bias, (const float *)cur->ptr,
+                        row1024, 1024u);
+            } else
+#endif
             glm53_vision_bias_kernel<<<
                 (unsigned)((row1024 + 255u) / 256u), 256u, 0,
                 DS4_DEEPSEEK4_VISION_STREAM>>>(
@@ -340,6 +456,15 @@ extern "C" int ds4_gpu_deepseek4_vision_encode(
         if (ok) ok = deepseek4_vision_round_tensor(
                 mlp_w1, row5632, "DeepSeek vision MLP input round");
         if (ok) {
+#ifdef __HIP_PLATFORM_AMD__
+            if (DS4_VISION_PROJECTION == 5120u) {
+                deepseek41_vision_swiglu_split_kernel<<<
+                    (unsigned)((row2816 + 255u) / 256u), 256u, 0,
+                    DS4_DEEPSEEK4_VISION_STREAM>>>(
+                        (float *)mlp_mid->ptr, (const float *)mlp_w1->ptr,
+                        row2816, 2816u);
+            } else
+#endif
             deepseek4_vision_swiglu_split_kernel<<<
                 (unsigned)((row2816 + 255u) / 256u), 256u, 0,
                 DS4_DEEPSEEK4_VISION_STREAM>>>(
@@ -386,43 +511,43 @@ extern "C" int ds4_gpu_deepseek4_vision_encode(
     }
     if (ok) ok = ds4_gpu_glm53_matmul_bf16(
             align_a, model_map, model_size, weights->aligner_w1,
-            9216u, 4096u, align_in, aligned_rows);
+            9216u, DS4_VISION_PROJECTION, align_in, aligned_rows);
     if (ok) {
         bias = glm53_vision_weight(
-                model_map, model_size, weights->aligner_w1_bias, 4096u,
+                model_map, model_size, weights->aligner_w1_bias, DS4_VISION_PROJECTION,
                 "DeepSeek vision aligner hidden bias");
         if (!bias) ok = 0;
     }
     if (ok) {
         deepseek4_vision_gelu_bias_kernel<<<
-            (unsigned)((aligned4096 + 255u) / 256u), 256u, 0,
+            (unsigned)((DS4_VISION_ALIGNED + 255u) / 256u), 256u, 0,
             DS4_DEEPSEEK4_VISION_STREAM>>>(
                 (float *)align_b->ptr, (const float *)align_a->ptr,
-                bias, aligned4096, 4096u);
+                bias, DS4_VISION_ALIGNED, DS4_VISION_PROJECTION);
         ok = glm53_vision_launch_ok("DeepSeek vision aligner GELU");
     }
     if (ok) ok = ds4_gpu_glm53_matmul_bf16(
             align_a, model_map, model_size, weights->aligner_w2,
-            4096u, 4096u, align_b, aligned_rows);
+            DS4_VISION_PROJECTION, DS4_VISION_PROJECTION, align_b, aligned_rows);
     if (ok) {
         bias = glm53_vision_weight(
-                model_map, model_size, weights->aligner_w2_bias, 4096u,
+                model_map, model_size, weights->aligner_w2_bias, DS4_VISION_PROJECTION,
                 "DeepSeek vision aligner output bias");
         if (!bias) ok = 0;
     }
     if (ok) {
         glm53_vision_bias_kernel<<<
-            (unsigned)((aligned4096 + 255u) / 256u), 256u, 0,
+            (unsigned)((DS4_VISION_ALIGNED + 255u) / 256u), 256u, 0,
             DS4_DEEPSEEK4_VISION_STREAM>>>(
-                (float *)align_a->ptr, bias, NULL, aligned4096, 4096u);
+                (float *)align_a->ptr, bias, NULL, DS4_VISION_ALIGNED, DS4_VISION_PROJECTION);
         ok = glm53_vision_launch_ok(
                 "DeepSeek vision aligner output bias");
     }
     if (ok) ok = deepseek4_vision_round_tensor(
-            align_a, aligned4096, "DeepSeek vision aligner output round");
+            align_a, DS4_VISION_ALIGNED, "DeepSeek vision aligner output round");
     if (ds4_gpu_end_commands() == 0) ok = 0;
     if (ok) ok = ds4_gpu_tensor_read(
-            align_a, 0, out, aligned4096 * sizeof(float));
+            align_a, 0, out, DS4_VISION_ALIGNED * sizeof(float));
 
 cleanup:
     ds4_gpu_tensor_free(align_b);
@@ -442,3 +567,6 @@ cleanup:
 }
 
 #undef DS4_DEEPSEEK4_VISION_STREAM
+
+#undef DS4_VISION_PROJECTION
+#undef DS4_VISION_ALIGNED

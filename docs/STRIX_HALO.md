@@ -33,21 +33,13 @@ the container. Do not mix header versions as a general workaround.
 
 ## GPU-visible memory
 
-Check the memory pool reported by `rocminfo`. Some 128 GB configurations expose
-only about 62 GB to the GPU, which is insufficient for resident Flash Q2 plus
-runtime buffers. Firmware and kernel GTT/TTM settings control this limit.
-
-The native reference setup used these memory parameters:
+Check the GPU-visible memory pool reported by `rocminfo`. Some 128 GB systems expose only about 62 GiB to the GPU. The tested 128 GB Fedora Linux Strix Halo system, running a recent kernel and ROCm 10.0, used these boot parameters:
 
 ```text
-amdgpu.gttsize=126976 ttm.pages_limit=32505856 ttm.page_pool_size=32505856
+amd_iommu=off amdgpu.gttsize=126976 ttm.pages_limit=32505856
 ```
 
-They are a system-specific starting point, not an allocation budget for
-DwarfStar. Preserve existing boot options and consult your kernel's settings
-before changing them. Keep RAM available for the OS even when the GPU can
-address most of it. Do not disable the IOMMU merely to copy another host's
-configuration; doing so changes device isolation.
+The GTT/TTM settings expose about 124 GiB to the GPU. An SSD expert-cache request such as `92GB` is fitted to that GPU-visible limit as well as available system RAM; a stock ~62 GiB pool can therefore yield a much smaller cache. `amd_iommu=off` was part of the tested setup, but is not required for GTT sizing and disables DMA isolation. Keep RAM available for the OS. See the [host configuration guide](https://strix-halo-toolboxes.com/#config) for Fedora, Ubuntu/Debian, and systemd-boot instructions.
 
 ## Build and run Flash
 
@@ -62,21 +54,84 @@ larger mixed and Q4 models have substantially higher memory requirements.
 Flash's ROCm resident and pipeline paths should not be confused with the GLM
 SSD-streaming path.
 
+DeepSeek V4 Flash 0731 IQ2_XXS/Q2_K with Q8 projections uses optimized
+2K/4K resident-prefill kernels automatically on `gfx1151`. Dispatch checks
+tensor layouts, context bounds and execution mode before selecting them;
+other shapes use the existing kernels. See [Halo source credits](HALO_THIRD_PARTY.md).
+
 ## DeepSeek V4.1 Flash
 
-Use Q2 with SSD streaming on a 128 GB machine:
+- ROCm 10.0 supports published V4.1 Flash Q2 text/vision, resident experts, resident DSpark speculative decoding, SSD streaming and [two-machine TCP/RoCE](CLUSTERING_ROCM.md). Engram remains disk-backed.
+- SSD measurements: 128 GB Framework Desktop, Ryzen AI Max+ 395, Radeon `gfx1151`; SK hynix PC711 1 TB (PCIe 3.0 ×4, ext4) holds the model. Linux `7.2.5-100.fc43.x86_64`, ROCm SDK `10.0.0-4` / HIP `7.15.26333`, TuneD **`accelerator-performance`**.
 
-```sh
+### SSD performance
+
+Native `ds4-bench`, 76 GiB expert-cache request, 34,816 allocated context, 128 greedy output tokens per frontier, no DSpark or images. First row is fresh prefill; subsequent rows append to restored prefixes. One run per row, startup excluded; no cold-cache claim. **Tokens/s**:
+
+| Context tokens | Appended tokens | Prefill | Decode |
+|---:|---:|---:|---:|
+| 2,048 | 2,048 | 47.32 | 10.18 |
+| 4,096 | 2,048 | 86.48 | 10.27 |
+| 8,192 | 4,096 | 154.58 | 10.46 |
+| 16,384 | 8,192 | 271.06 | 10.34 |
+| 32,768 | 16,384 | 333.84 | 10.34 |
+
+- Full frontier logits and continuations match the corresponding controls.
+- The tuned Engram matrix path requires hipBLASLt 100401, revision `8d1ae90e`; other library versions retain the fallback and may have different prefill performance.
+- Cache admission depends on available RAM, context and sessions; images may need a smaller cache. The GPU-visible limit shares system RAM and is not a cache budget. Populated 256K is unqualified.
+- Resident/SSD image and cache checks pass; see [quality results](../QA_BEFORE_RELEASES.md#deepseek-v41-flash-rocmgfx1151). Image inputs are excluded from text timing.
+
+### Run text or vision
+
+```bash
+make strix-halo ROCM_ARCH=gfx1151
 ./download_model.sh ds41f-q2
-./ds4 --rocm -m gguf/DeepSeek-V4.1-Flash-Q2.gguf \
-  --ssd-streaming --ctx 4096
+./download_model.sh ds41f-vision
+MODEL=gguf/DeepSeek-V4.1-Flash-Q2.gguf
+VISION=gguf/DeepSeek-V4.1-Flash-Vision.gguf
+
+# CLI, text
+./ds4 --rocm -m "$MODEL" --ssd-streaming \
+  --ssd-streaming-cache-experts 76GB --ctx 34816
+
+# HTTP server, text and images
+./ds4-server --rocm -m "$MODEL" --vision "$VISION" \
+  --ssd-streaming --ssd-streaming-cache-experts 76GB --ctx 34816 \
+  --batched-session 1 --host 127.0.0.1 --port 8080
 ```
 
-The 341 GiB GGUF includes disk-only Engram tables. Keep it on a fast local
-SSD and start with automatic cache sizing. The matching
-[V4.1 DSpark](SPECULATIVE_DECODING.md#deepseek-v41-flash-dspark) support file
-is optional. V4.1 vision and network TP are not supported on ROCm.
-Large prefills are not yet tuned on this backend and can be slow.
+For sufficient RAM to keep experts resident, omit both SSD options. Keep `--vision` for images and set `--ctx` to the required allocation. See [image requests](MODELS.md#vision).
+
+### Resident DSpark speculative decoding
+
+DSpark requires resident target experts and a separate support GGUF. The qualified support file is the released native-MXFP4 draft at the pinned revision below (7,966,294,016 bytes; SHA256 `7a2217ca6ef27cbce4ac934d8b6f59f2f6158ec288527bbe72b86dcbed95d4b5`):
+
+```bash
+DSPARK=gguf/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf
+curl -L --fail -o "$DSPARK" \
+  https://huggingface.co/kernelpool/DeepSeek-V4.1-Flash-MXFP4-GGUF/resolve/22a073e51781f43e6814885bb4b3cbe540f175ef/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf
+
+./ds4-server --rocm -m "$MODEL" --mtp-model "$DSPARK" --dspark \
+  --ctx 8192 --host 127.0.0.1 --port 8080
+```
+
+Use normal positive-temperature sampling with `--dspark`; `--mtp-exact-sampling` is a separate diagnostic mode. Set `DS4_DSPARK_STATS=1` to print proposal, acceptance and verifier counters at shutdown. The target contributes about 151.76 GiB of resident tensor spans and the support model about 7.42 GiB, before context and runtime buffers. DSpark is not available with SSD expert streaming.
+
+### Reproduce SSD measurements
+
+Prepare `bench-prompt.txt` as in the [cluster benchmark](CLUSTERING_ROCM.md#reproduce-the-table), then run from the engine build directory:
+
+```bash
+tuned-adm active    # Verify accelerator-performance during the workload
+DS4_BENCH_SNAPSHOT_MAX_BYTES=2147483648 ./ds4-bench --rocm -m "$MODEL" \
+  --ssd-streaming --ssd-streaming-cache-experts 76GB \
+  --prompt-file bench-prompt.txt \
+  --ctx-start 2048 --ctx-max 32768 --step-mul 2 --ctx-alloc 34816 \
+  --gen-tokens 128 --show-output --csv ssd.csv \
+  --dump-frontier-logits-dir ssd-frontiers
+```
+
+Save CSV, full frontier files, printed output, revision/build flags, model filename/size, active power profile and memory/swap counters. Leave sufficient RAM for the 2 GiB snapshot cap.
 
 ## GLM 5.3 Flash
 

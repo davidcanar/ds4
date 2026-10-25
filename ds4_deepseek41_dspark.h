@@ -2,6 +2,12 @@
 #ifndef DS4_DEEPSEEK41_DSPARK_H
 #define DS4_DEEPSEEK41_DSPARK_H
 
+#ifdef DS4_ROCM_BUILD
+#define DS41_DSPARK_GRAPH_ARG(d) &d->verified[0],
+#else
+#define DS41_DSPARK_GRAPH_ARG(d)
+#endif
+
 #define DS41_DRAFT_WINDOW 128u
 #define DS41_DRAFT_ROWS 5u
 #define DS41_VERIFY_ROWS (DS41_DRAFT_ROWS + 1u)
@@ -223,7 +229,7 @@ static bool ds41_dspark_stage(ds41_dspark *d, const ds4_model *m, uint32_t stage
     ds41_prefill_row *b = &d->batch;
     const ds4_layer_weights *l = &d->weights->stage[stage].block;
     const uint32_t n = DS41_DRAFT_ROWS, past = pos < DS41_DRAFT_WINDOW ? pos : DS41_DRAFT_WINDOW;
-    if (!ds41_hc_mix_batch(b, m, l, false, n) ||
+    if (!ds41_hc_mix_batch(DS41_DSPARK_GRAPH_ARG(d) b, m, l, false, n) ||
         !(stage ? ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual, b->ffn_split, DS4_N_EMBD, DS4_N_HC) :
                   ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre, DS4_N_EMBD, DS4_N_HC)) ||
         !ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, n, DS4_V41_BF16) ||
@@ -244,7 +250,7 @@ static bool ds41_dspark_stage(ds41_dspark *d, const ds4_model *m, uint32_t stage
         !ds4_gpu_dsv41_quantize(b->heads, DS4_N_HEAD * DS4_N_HEAD_DIM, n, DS4_V41_BF16) ||
         !ds4_gpu_dsv41_rope(b->heads, DS4_N_HEAD_DIM, DS4_N_HEAD, n, pos, false, true) ||
         !ds41_dspark_attention_output(b, m, l) ||
-        !ds41_after_attention_batch(b, m, l, n)) {
+        !ds41_after_attention_batch(DS41_DSPARK_GRAPH_ARG(d) b, m, l, n)) {
         fprintf(stderr, "ds4: V4.1 draft attention failed\n");
         return false;
     }

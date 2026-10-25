@@ -188,12 +188,12 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
             opt(fp, c, "--mtp-timing", "Enable embedded MTP and print acceptance/timing counters.");
             opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp-model.");
-            opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Greedy/opportunistic default: resident Spark Q2 0.4, two-Spark Flash Q2/MXFP4 0, Metal 0.6, other CUDA/ROCm 0.7; exact sampling: 0.8");
+            opt(fp, c, "--dspark-confidence F", "Use a fixed DSpark confidence threshold 0..1. Default: adaptive cost schedule for V4.1 on ROCm gfx1151; resident Spark Q2 0.4, two-Spark Flash Q2/MXFP4 0, Metal 0.6, other CUDA/ROCm 0.7; exact sampling: 0.8");
             opt(fp, c, "--mtp-exact-sampling", "Preserve the ordinary temperature distribution instead of accepting target-matching greedy drafts directly.");
             opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");
         } else if (tool == DS4_HELP_BENCH) {
-            opt(fp, c, "--dspark", "Benchmark greedy DSpark using the support GGUF passed with --mtp-model.");
-            opt(fp, c, "--dspark-confidence F", "DSpark confidence pruning threshold 0..1.");
+            opt(fp, c, "--dspark", "Enable DSpark speculative decoding using the support GGUF passed with --mtp-model.");
+            opt(fp, c, "--dspark-confidence F", "Use a fixed DSpark confidence threshold 0..1 instead of the backend default policy.");
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch resident weights at startup to reduce first-use stalls.");
@@ -255,6 +255,9 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
     opt(fp, c, "--tensor-parallel", "Switch --role/--listen/--coordinator to two-machine tensor parallelism.");
     opt(fp, c, "--transport auto|rdma|tcp", "Tensor gate transport. Default: auto");
+#if defined(__linux__) && defined(DS4_ROCM_BUILD)
+    opt(fp, c, "--rdma-port N", "Select the local active Ethernet verbs port. Default: 1");
+#endif
     opt(fp, c, "--rdma-device NAME", "Select a verbs device when auto-detection is ambiguous.");
     opt(fp, c, "--rdma-gid-index N", "Select the local verbs GID index.");
     opt(fp, c, "--tensor-parallel-token-prefill", "GLM diagnostic: prefill one token at a time for exact arithmetic.");

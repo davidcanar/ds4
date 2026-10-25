@@ -26,6 +26,29 @@
 #include "mmid.cuh"
 #include "ds4_mmq_d2r.cuh"
 
+#if defined(GGML_USE_HIP)
+// One small producer on the existing stream. Thread0 scans384 bounds;128
+// threads fill all575 slots and then their disjoint active expert records.
+static __global__ void ds4_mmq_compact_produce(const int32_t *bounds, ds4_mmq_compact::List *out) {
+    __shared__ uint32_t offsets[ds4_mmq_compact::experts + 1];
+    __shared__ uint32_t status;
+    const uint32_t t = threadIdx.x;
+    for (uint32_t i = t; i < ds4_mmq_compact::capacity; i += blockDim.x)
+        out->entries[i] = {UINT32_MAX, UINT32_MAX};
+    if (t == 0) {
+        status = ds4_mmq_compact::prefix(bounds, offsets);
+        out->status = status;
+        out->count = status ? 0 : offsets[ds4_mmq_compact::experts];
+    }
+    __syncthreads();
+    if (status) return;
+    for (uint32_t e = t; e < ds4_mmq_compact::experts; e += blockDim.x)
+        for (uint32_t i = offsets[e]; i < offsets[e + 1]; i++)
+            out->entries[i] = {e, i - offsets[e]};
+}
+
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1705,6 +1728,13 @@ struct ds4_mmq_fused_down {
     size_t        input_q8_ext_bytes;
 };
 
+struct ds4_mmq_swiglu_epilogue {
+    const float * router_weights;
+    float       * mid_f32;
+    half        * mid_f16;
+    float         clamp;
+};
+
 static bool ds4_mmq_take_scratch(
         void *base, size_t capacity, size_t *offset,
         size_t bytes, size_t alignment, void **result) {
@@ -1784,12 +1814,13 @@ int ds4_mmq_moe_pair_impl(
         /* ds4 (P3): see ds4_mmq_moe_impl. */
         bool            sanitize_out = true,
         const ds4_mmq_fused_down *fused_down = nullptr,
-        bool allow_d2r = true) {
+        bool allow_d2r = true,
+        const ds4_mmq_swiglu_epilogue *swiglu_epilogue = nullptr) {
 
     const bool direct_gateup_q8 =
         fused_down != nullptr && fused_down->direct_gateup_q8;
     if (!W_a || !W_b || !X_f32 || !ids ||
-        (!direct_gateup_q8 && (!out_a || !out_b))) {
+        (!direct_gateup_q8 && (!out_a || (!out_b && !swiglu_epilogue)))) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
     }
@@ -1818,6 +1849,12 @@ int ds4_mmq_moe_pair_impl(
            !fused_down->work_scratch || fused_down->work_scratch_bytes == 0)) ||
          !fused_down->out || fused_down->out_dim <= 0 || M % 256 != 0)) {
         fprintf(stderr, "%s: invalid fused Q2_K down configuration\n", tag);
+        return -1;
+    }
+    if (swiglu_epilogue &&
+        (type != GGML_TYPE_IQ2_XXS || fused_down ||
+         !swiglu_epilogue->router_weights || !swiglu_epilogue->mid_f32)) {
+        fprintf(stderr, "%s: invalid weighted SwiGLU epilogue\n", tag);
         return -1;
     }
 
@@ -1851,6 +1888,11 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s01          = (int64_t)K / blck;
     const int64_t s02          = (int64_t)M * s01;
 
+#if defined(GGML_USE_HIP)
+    // Declared first so the list remains owned through both projections.
+    ggml_cuda_pool_alloc<ds4_mmq_compact::List> compact_alloc;
+    ds4_mmq_compact::List *compact_list = nullptr;
+#endif
     ggml_cuda_pool_alloc<int32_t> ids_src1_alloc;
     ggml_cuda_pool_alloc<int32_t> ids_dst_alloc;
     ggml_cuda_pool_alloc<int32_t> expert_bounds_alloc;
@@ -1971,6 +2013,7 @@ int ds4_mmq_moe_pair_impl(
     const bool use_stream_k =
         (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc);
+    if (swiglu_epilogue && use_stream_k) return -13;
     /* The fused target-prefill path receives a true top-k assignment: one
      * token cannot select the same expert twice, so no expert bucket can
      * exceed n_tokens rows. Keep the conservative gathered-row bound for all
@@ -1985,6 +2028,23 @@ int ds4_mmq_moe_pair_impl(
     const int64_t routed_ncols_max = (fused_down || tight_iq2_ncols)
         ? (int64_t)n_tokens
         : ne_get_rows;
+
+#if defined(GGML_USE_HIP)
+    const bool compact_eligible =
+        type == GGML_TYPE_IQ2_XXS && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
+        n_tokens == 2048 && n_experts == 384 && n_expert_used == 6 && K == 5120 && M == 2304 &&
+        !direct_gateup_q8 && !fused_down && !persistent_pair_maps && !xa_soa && !xb_soa &&
+        !use_stream_k && stream == nullptr && routed_ncols_max == 2048 &&
+        get_mmq_y_host(cc) == 64 && get_mmq_x_max_host(cc) == 64 &&
+        ggml_cuda_info().devices[dev].warp_size == 32 && mmq_get_nwarps_host(cc,32) == 4;
+    if (compact_eligible) {
+        compact_list = compact_alloc.alloc(ctx->pool(),1);
+        ds4_mmq_compact_produce<<<1,128,0,stream>>>(expert_bounds,compact_list);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) return -102;
+    }
+
+#endif
 
     /* The materialized path stream-frees gate/up Q8_1 before allocating the
      * down Q8_1. The direct path needs both simultaneously, but writes down
@@ -2178,7 +2238,7 @@ int ds4_mmq_moe_pair_impl(
     }
 
     bool gate_up_done = false;
-    if (type == GGML_TYPE_IQ2_XXS && xa_soa != nullptr && xb_soa != nullptr &&
+    if (!swiglu_epilogue && type == GGML_TYPE_IQ2_XXS && xa_soa != nullptr && xb_soa != nullptr &&
         allow_d2r && d2r_enabled() && d2r_iq2_enabled() && K % 256 == 0 &&
         ne_get_rows >= d2r_min_cols()) {
         static int d2r_iq2_avail_cc = -1;
@@ -2236,6 +2296,10 @@ int ds4_mmq_moe_pair_impl(
         /*x_soa=*/xa_soa,
         /*soa_blocks=*/soa_blocks,
     };
+#if defined(GGML_USE_HIP)
+    args.compact_list = compact_list;
+#endif
+
 
     {
         ds4_mmq_nvtx_scope stage(
@@ -2254,6 +2318,13 @@ int ds4_mmq_moe_pair_impl(
     args.x     = (const char *)W_b;
     args.dst   = out_b;
     args.x_soa = xb_soa;
+    if (swiglu_epilogue) {
+        args.epilogue_gate = out_a;
+        args.epilogue_weights = swiglu_epilogue->router_weights;
+        args.epilogue_mid = swiglu_epilogue->mid_f32;
+        args.epilogue_mid_h = swiglu_epilogue->mid_f16;
+        args.epilogue_clamp = swiglu_epilogue->clamp;
+    }
     {
         ds4_mmq_nvtx_scope stage(
                 "ds4/prefill/moe/iq2_up",
@@ -2391,7 +2462,7 @@ int ds4_mmq_moe_pair_impl(
             }
         }
     }
-    if (sanitize_out) {
+    if (sanitize_out && !swiglu_epilogue) {
         ds4_mmq_sanitize_f32(out_a, (uint64_t)M * (uint64_t)ne_get_rows, stream);
         ds4_mmq_sanitize_f32(out_b, (uint64_t)M * (uint64_t)ne_get_rows, stream);
     }
@@ -2470,6 +2541,25 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair(
     return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
         "ds4_mmq_iq2_xxs_moe_pair", W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_iq2_xxs_moe_pair_swiglu(
+        const void * W_gate, const void * W_up,
+        const float * X, const int32_t * ids, const float * router_weights,
+        float * gate, float * discard, float * mid_f32, void * mid_f16,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        float clamp, cudaStream_t stream) {
+    const ds4_mmq_swiglu_epilogue epilogue = {
+        router_weights,
+        mid_f32,
+        (half *)mid_f16,
+        clamp,
+    };
+    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
+        "ds4_mmq_iq2_xxs_moe_pair_swiglu", W_gate, W_up, X, ids,
+        gate, discard, M, K, n_tokens, n_experts, n_expert_used, stream,
+        nullptr, nullptr, 0, /*sanitize_out=*/false, nullptr,
+        /*allow_d2r=*/false, &epilogue);
 }
 
 /* ds4 (P4 Inc3): paired mmq MoE over the aligned-SoA IQ2_XXS gate/up

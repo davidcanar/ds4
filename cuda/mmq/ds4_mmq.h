@@ -301,6 +301,28 @@ int ds4_mmq_iq2_xxs_moe_pair(
     int             n_expert_used,
     cudaStream_t    stream);
 
+// gfx1151 routed-prefill entry: fuse the up-projection MMQ write-back with
+// finite sanitization, clamp, SwiGLU, router weighting and optional F16 mid.
+// The gate output remains materialized for the epilogue; discard is valid
+// scratch and is not written on success.
+int ds4_mmq_iq2_xxs_moe_pair_swiglu(
+    const void    * W_gate,
+    const void    * W_up,
+    const float   * X_f32,
+    const int32_t * ids,
+    const float   * router_weights,
+    float         * gate,
+    float         * discard,
+    float         * mid_f32,
+    void          * mid_f16,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    float           clamp,
+    cudaStream_t    stream);
+
 // ds4 (P4 Inc3): same contract as ds4_mmq_iq2_xxs_moe_pair but over the
 // aligned-SoA artifacts (weight server --repack-iq2-aligned); see
 // ds4_mmq_q2_K_moe_soa.

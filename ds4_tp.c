@@ -22,7 +22,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -30,7 +29,20 @@
 #include "ds4_tp.h"
 #include "ds4_gpu.h"
 
-#if (defined(__APPLE__) || defined(__linux__)) && defined(__has_include)
+#if defined(__linux__) && defined(DS4_ROCM_BUILD)
+#define DS4_TP_LINUX 1
+#include "ds4_tp_io.h"
+#include <sys/random.h>
+#if !defined(DS4_TP_NO_ROCE) && defined(__has_include)
+#if __has_include(<infiniband/verbs.h>)
+#include <infiniband/verbs.h>
+#include <dlfcn.h>
+#define DS4_TP_HAVE_ROCE 1
+#endif
+#endif
+#endif
+
+#if !defined(DS4_TP_LINUX) && (defined(__APPLE__) || defined(__linux__)) && defined(__has_include)
 #if __has_include(<infiniband/verbs.h>)
 #include <infiniband/verbs.h>
 #define DS4_TP_HAVE_VERBS 1
@@ -49,8 +61,13 @@
  * 19: DSpark drafter agreement, draft commands and proposal-check flags.
  * 20: VERIFY_COMMIT uses the command mailbox when negotiated.
  * 21: SPEC_RESTORE restores a speculative prefix with a status-only ACK.
- * 22: hello grows odl_ok after rdma_max_msg (OdinLink negotiation). */
+ * 22: hello grows odl_ok after rdma_max_msg (OdinLink negotiation).
+ * 23: ROCm checkpoint restore payload is added to the OdinLink-capable wire. */
+#ifdef DS4_TP_LINUX
+#define DS4_TP_PROTOCOL_VERSION 23u
+#else
 #define DS4_TP_PROTOCOL_VERSION 22u
+#endif
 
 /* Leader -> worker command mailbox.  Command frames are written with RDMA
  * WRITE into a ring in the worker's slab and polled from host memory, so
@@ -116,6 +133,9 @@ typedef struct {
     uint32_t rdma_max_msg; /* formerly zero padding: zero offers legacy 16 KiB */
     uint32_t odl_ok;       /* this side has a usable OdinLink device */
     uint64_t gate_slot_mask[DS4_TP_GATE_MASK_WORDS];
+#ifdef DS4_TP_LINUX
+    uint64_t nonce;
+#endif
 } ds4_tp_hello_fixed;
 
 typedef struct {
@@ -331,6 +351,10 @@ struct ds4_tp {
     int data_fd;                /* TCP fallback, headers, and verify gates */
     bool rdma_active;
     bool odl_active;
+#ifdef DS4_TP_LINUX
+    struct ds4_tp_roce *roce;
+    uint64_t epoch;
+#endif
     uint32_t peer_ctx;
     uint32_t n_layer;
     uint32_t n_embd;
@@ -395,6 +419,10 @@ static void tp_set_err(char *err, size_t errlen, const char *fmt, ...) {
     vsnprintf(err, errlen, fmt, ap);
     va_end(ap);
 }
+
+#ifdef DS4_TP_LINUX
+#include "ds4_tp_roce.h"
+#endif
 
 static int tp_write_full(int fd, const void *buf, size_t len) {
     const char *p = buf;
@@ -673,12 +701,14 @@ static int tp_frame_header_wait(ds4_tp *tp, int fd, uint32_t *type, uint32_t *by
     return tp_read_frame_header(fd, type, bytes);
 }
 
+#ifdef DS4_TP_HAVE_VERBS
 static int tp_read_full_wait(ds4_tp *tp, int fd, void *buf, size_t len) {
     if (tp->odl_active &&
         !tp_control_wait(tp, fd, (double)(tp->gate_timeout_ms + 2000u) / 1000.0))
         return 0;
     return tp_read_full(fd, buf, len);
 }
+#endif
 
 /* ------------------------------------------------------------------------
  * Options and CLI.
@@ -700,6 +730,9 @@ void ds4_tp_usage(FILE *fp) {
         "  --tensor-parallel-token-prefill\n"
         "                              GLM diagnostic: prefill one token at a time.\n"
         "  --debug-hash <n>            Cross-check hidden state every n tokens.\n");
+#ifdef DS4_TP_LINUX
+    fprintf(fp, "  --rdma-port <1..255>        Linux RoCE port (default 1).\n");
+#endif
 }
 
 int ds4_tp_parse_cli_arg(
@@ -739,6 +772,18 @@ int ds4_tp_parse_cli_arg(
         }
         opt->rdma_gid_index = (int)value;
         opt->rdma_gid_index_set = true;
+#ifdef DS4_TP_LINUX
+    } else if (!strcmp(arg, "--rdma-port")) {
+        if (i + 1 >= argc) goto missing;
+        char *end = NULL;
+        errno = 0;
+        long value = strtol(argv[++i], &end, 10);
+        if (errno || !end || *end || value < 1 || value > 255) {
+            tp_set_err(err, errlen, "invalid --rdma-port %s", argv[i]);
+            return DS4_TP_CLI_ERROR;
+        }
+        opt->rdma_port = (int)value;
+#endif
     } else if (!strcmp(arg, "--tensor-parallel-token-prefill")) {
         opt->glm_token_prefill = true;
     } else if (!strcmp(arg, "--debug-hash")) {
@@ -827,7 +872,7 @@ int ds4_tp_validate_engine_options(
 {
     if (!ds4_tp_enabled(&opt->tp)) {
         if (opt->tp.requested || opt->tp.transport != DS4_TP_TRANSPORT_AUTO ||
-            opt->tp.rdma_device || opt->tp.rdma_gid_index_set ||
+            opt->tp.rdma_device || opt->tp.rdma_port || opt->tp.rdma_gid_index_set ||
             opt->tp.glm_token_prefill || opt->tp.debug_hash != 0) {
             tp_set_err(err, errlen,
                        "tensor-parallel options require --tensor-parallel and --role");
@@ -835,6 +880,18 @@ int ds4_tp_validate_engine_options(
         }
         return 1;
     }
+#ifdef DS4_ROCM_BUILD
+    if (opt->backend != DS4_BACKEND_METAL
+#ifdef DS4_TP_LINUX
+        && opt->backend != DS4_BACKEND_CUDA
+#endif
+        ) {
+#ifdef DS4_TP_LINUX
+        tp_set_err(err, errlen, "tensor parallelism requires Metal or V4.1 ROCm");
+#else
+        tp_set_err(err, errlen, "tensor parallelism requires the Metal backend");
+#endif
+#else
     bool supported_backend = opt->backend == DS4_BACKEND_METAL;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     supported_backend |= opt->backend == DS4_BACKEND_CUDA;
@@ -845,8 +902,20 @@ int ds4_tp_validate_engine_options(
     }
     if (opt->backend == DS4_BACKEND_CUDA && (opt->cuda_tensor_parallel || opt->ssd_streaming)) {
         tp_set_err(err, errlen, "network CUDA TP requires one GPU per rank and resident expert shards");
+#endif
         return 0;
     }
+#ifdef DS4_TP_LINUX
+    const bool external_dspark = opt->dspark && opt->mtp_path && opt->mtp_path[0];
+    const bool incomplete_support =
+        (opt->dspark || (opt->mtp_path && opt->mtp_path[0])) && !external_dspark;
+    if (opt->backend == DS4_BACKEND_CUDA &&
+        (opt->ssd_streaming || opt->glm_mtp || incomplete_support ||
+         opt->cuda_tensor_parallel)) {
+        tp_set_err(err, errlen, "V4.1 ROCm network TP requires resident weights; DSpark requires --dspark with --mtp-model, and local multi-GPU TP is unavailable");
+        return 0;
+    }
+#endif
     if (opt->distributed.role != DS4_DISTRIBUTED_NONE) {
         tp_set_err(err, errlen, "tensor parallelism and --role distributed modes are exclusive");
         return 0;
@@ -2918,6 +2987,23 @@ static void tp_odl_close(ds4_tp *tp) {
  * Bring-up.
  * --------------------------------------------------------------------- */
 
+#ifdef DS4_TP_LINUX
+/* Capability bits use the public transport enum; AUTO is a request, not a capability. */
+static int tp_linux_select(uint32_t request, uint32_t peer_request,
+                           uint32_t caps, uint32_t peer_caps) {
+    if (request > DS4_TP_TRANSPORT_ODL ||
+        peer_request > DS4_TP_TRANSPORT_ODL) return -1;
+    if (request && peer_request && request != peer_request) return -1;
+    uint32_t chosen = request ? request : peer_request;
+    uint32_t common = caps & peer_caps;
+    if (chosen) return common & (1u << chosen) ? (int)chosen : -1;
+    if (common & (1u << DS4_TP_TRANSPORT_ODL)) return DS4_TP_TRANSPORT_ODL;
+    if (common & (1u << DS4_TP_TRANSPORT_RDMA)) return DS4_TP_TRANSPORT_RDMA;
+    return common & (1u << DS4_TP_TRANSPORT_TCP) ? DS4_TP_TRANSPORT_TCP : -1;
+}
+
+#endif
+
 static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
                              int odl_ok, char *err, size_t errlen) {
     ds4_tp_hello_fixed mine = {
@@ -2940,11 +3026,29 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
 #endif
         .odl_ok = (uint32_t)odl_ok,
     };
+#ifdef DS4_TP_LINUX
+    uint32_t caps = (1u << DS4_TP_TRANSPORT_TCP) |
+        (rdma_ok ? 1u << DS4_TP_TRANSPORT_RDMA : 0u) |
+        (odl_ok ? 1u << DS4_TP_TRANSPORT_ODL : 0u);
+    mine.odl_ok = (uint32_t)tp->opt.transport | (caps << 8);
+    ssize_t nonce_bytes;
+    do { nonce_bytes = getrandom(&mine.nonce, sizeof(mine.nonce), 0); }
+    while (nonce_bytes < 0 && errno == EINTR);
+    if (nonce_bytes != sizeof(mine.nonce)) {
+        tp_set_err(err, errlen, "tp connection nonce: %s", strerror(errno));
+        return 0;
+    }
+#endif
     memcpy(mine.gate_slot_mask, id->gate_slot_mask,
            sizeof(mine.gate_slot_mask));
     ds4_tp_hello_fixed theirs;
+#ifdef DS4_TP_LINUX
+    if (!ds4_tp_io_exchange(tp->control_fd, &mine, &theirs,
+                           offsetof(ds4_tp_hello_fixed, nonce), tp->timeout_sec * 1000u, &tp->failed)) {
+#else
     if (!tp_write_full(tp->control_fd, &mine, sizeof(mine)) ||
         !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
+#endif
         tp_set_err(err, errlen, "tp hello exchange failed");
         return 0;
     }
@@ -2957,6 +3061,13 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
                    theirs.version, DS4_TP_PROTOCOL_VERSION);
         return 0;
     }
+#ifdef DS4_TP_LINUX
+    if (!ds4_tp_io_exchange(tp->control_fd, &mine.nonce, &theirs.nonce,
+                           sizeof(mine.nonce), tp->timeout_sec * 1000u, &tp->failed)) {
+        tp_set_err(err, errlen, "tp nonce exchange failed");
+        return 0;
+    }
+#endif
     if (theirs.role == mine.role) {
         tp_set_err(err, errlen, "tp hello: both sides claim role %u", mine.role);
         return 0;
@@ -2996,6 +3107,20 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
     memcpy(tp->gate_slot_mask, id->gate_slot_mask,
            sizeof(tp->gate_slot_mask));
     tp_slab_layout(tp);
+#ifdef DS4_TP_LINUX
+    /* The Linux hello packs the requested transport and capability mask into
+     * odl_ok. AUTO prefers OdinLink, then RoCE, then TCP. */
+    int selected = tp_linux_select(mine.odl_ok & 255u, theirs.odl_ok & 255u,
+                                   mine.odl_ok >> 8, theirs.odl_ok >> 8);
+    if (selected < 0) {
+        tp_set_err(err, errlen, "tp: incompatible transport requests or unavailable configured transport (local=%u peer=%u)",
+                   mine.odl_ok & 255u, theirs.odl_ok & 255u);
+        return 0;
+    }
+    tp->odl_active = selected == DS4_TP_TRANSPORT_ODL;
+    tp->rdma_active = selected == DS4_TP_TRANSPORT_RDMA;
+    tp->epoch = mine.nonce ^ theirs.nonce;
+#else
     /* Transport decision: OdinLink when both sides have it (auto prefers
      * it: lower latency than verbs over these links and no QP quirks);
      * otherwise RDMA only when both sides can, else TCP. */
@@ -3023,6 +3148,7 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
                    rdma_ok ? "the peer" : "this");
         return 0;
     }
+#endif
     return 1;
 }
 
@@ -3043,6 +3169,7 @@ int ds4_tp_create(
     tp->rank = opt->role == DS4_TP_LEADER ? 0 : 1;
     tp->control_fd = -1;
     tp->data_fd = -1;
+    atomic_init(&tp->failed, false);
     tp->timeout_sec = DS4_TP_DEFAULT_TIMEOUT_SEC;
     const char *tmo = getenv("DS4_TP_TIMEOUT_SEC");
     if (tmo) tp->timeout_sec = (uint64_t)atoi(tmo);
@@ -3064,6 +3191,14 @@ int ds4_tp_create(
         rdma_ok = tp_rdma_probe(&tp->rdma.api);
 #endif
 
+#ifdef DS4_TP_LINUX
+    if (opt->transport == DS4_TP_TRANSPORT_RDMA ||
+        (opt->transport == DS4_TP_TRANSPORT_AUTO && opt->rdma_device)) {
+        char reason[256] = "RoCE allocation failed";
+        rdma_ok = tp_roce_probe(tp, reason, sizeof(reason));
+        if (!rdma_ok) fprintf(stderr, "ds4-tp: %s\n", reason);
+    }
+#endif
     int listener = -1;
     if (tp->rank == 0) {
         listener = tp_listen(opt->listen_host, opt->listen_port, err, errlen);
@@ -3113,6 +3248,11 @@ int ds4_tp_create(
             goto fail;
         }
     }
+#ifdef DS4_TP_LINUX
+    if (tp->rdma_active) {
+        if (!tp_roce_connect(tp, err, errlen)) goto fail;
+    } else tp_roce_close(tp);
+#endif
     if (listener >= 0) close(listener);
     fprintf(stderr, "ds4-tp: %s connected, transport=%s gate-timeout=%llums\n",
             tp->rank == 0 ? "worker" : "leader",
@@ -3189,6 +3329,9 @@ void ds4_tp_free(ds4_tp *tp) {
     tp_rdma_close(tp);
 #endif
     tp_odl_close(tp);
+#ifdef DS4_TP_LINUX
+    tp_roce_close(tp);
+#endif
     if (tp->control_fd >= 0) close(tp->control_fd);
     if (tp->data_fd >= 0) close(tp->data_fd);
     free(tp);
@@ -3210,6 +3353,9 @@ bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
 bool ds4_tp_command_mailbox_active(const ds4_tp *tp) { (void)tp; return false; }
 #endif
 bool ds4_tp_is_odl(const ds4_tp *tp) { return tp->odl_active; }
+const char *ds4_tp_transport_name(const ds4_tp *tp) {
+    return tp->odl_active ? "odl" : tp->rdma_active ? "rdma" : "tcp";
+}
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp) { return tp->peer_ctx; }
 bool ds4_tp_failed(const ds4_tp *tp) {
     return tp && atomic_load_explicit(&tp->failed, memory_order_acquire);
@@ -3222,9 +3368,53 @@ void ds4_tp_mark_failed(ds4_tp *tp) {
  * Gate exchange.
  * --------------------------------------------------------------------- */
 
+#ifdef DS4_TP_LINUX
+typedef struct {
+    uint32_t magic, kind, layer, gate;
+    uint64_t epoch, seq, bytes;
+} ds4_tp_linux_gate_header;
+
+static int tp_linux_gate(ds4_tp *tp, uint32_t kind, uint32_t layer,
+                         uint32_t gate, uint64_t seq, const void *out,
+                         void *in, uint64_t bytes, uint64_t grace_ms) {
+    if (ds4_tp_failed(tp)) return 0;
+    if (!out || !in || !bytes || bytes > SIZE_MAX || layer >= tp->n_layer) {
+        errno = EINVAL;
+        goto fail;
+    }
+    if (tp->rdma_active && !tp_roce_prepare(tp, bytes)) goto fail;
+    ds4_tp_linux_gate_header h = {DS4_TP_MAGIC, kind, layer, gate,
+                                  tp->epoch, seq, bytes}, peer;
+    if (!ds4_tp_io_exchange(tp->data_fd, &h, &peer, sizeof(h),
+                           tp->gate_timeout_ms + grace_ms, &tp->failed)) goto fail;
+    if (memcmp(&h, &peer, sizeof(h))) { errno = EPROTO; goto fail; }
+    if (tp->rdma_active) {
+        if (!tp_roce_exchange(tp, out, in, bytes)) goto fail;
+        return 1;
+    }
+    if (!ds4_tp_io_exchange(tp->data_fd, out, in, bytes,
+                           tp->gate_timeout_ms, &tp->failed)) goto fail;
+    return 1;
+fail:
+    fprintf(stderr, "ds4-tp: gate failed (layer=%u kind=%u seq=%llu bytes=%llu): %s\n",
+            layer, kind, (unsigned long long)seq, (unsigned long long)bytes,
+            strerror(errno));
+    ds4_tp_mark_failed(tp);
+    return 0;
+}
+#endif
+
 int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
     if (!tp || ds4_tp_failed(tp)) return 0;
     if (tp->odl_active) return tp_odl_gate_exchange(tp, layer, gate, seq);
+#ifdef DS4_TP_LINUX
+    if (layer >= tp->n_layer || gate >= DS4_TP_GATES_PER_LAYER || !tp->slab) {
+        ds4_tp_mark_failed(tp); return 0;
+    }
+    return tp_linux_gate(tp, 1, layer, gate, seq,
+        tp->slab + ds4_tp_slab_out_offset(tp, layer, gate),
+        tp->slab + ds4_tp_slab_in_offset(tp, layer, gate), tp->vec_bytes, 0);
+#endif
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) return tp_rdma_gate_exchange(tp, layer, gate, seq);
 #endif
@@ -3356,8 +3546,6 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
     if (tp->data_fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS ||
         layer >= tp->n_layer * DS4_TP_BATCH_GATES_PER_LAYER) return 0;
     const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
-    ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
-                             (uint16_t)rows, seq };
     if (tp->odl_active) {
         /* The odl exchange numbers rounds itself and validates the chunk
          * sizes, so no header rendezvous is needed (it cost a TCP round
@@ -3368,6 +3556,14 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                 tp->slab + ds4_tp_slab_batch_in_offset(tp, layer),
                 bytes);
     }
+#ifdef DS4_TP_LINUX
+    if (layer >= tp->n_layer || !tp->slab) { ds4_tp_mark_failed(tp); return 0; }
+    return tp_linux_gate(tp, 2, layer, rows, seq,
+        tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
+        tp->slab + ds4_tp_slab_batch_in_offset(tp, layer), bytes, 0);
+#endif
+    ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
+                             (uint16_t)rows, seq };
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active && tp->rdma.block_active)
         return tp_rdma_block_gate_exchange(tp, layer, rows);
@@ -3412,8 +3608,11 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
     if (!tp || ds4_tp_failed(tp)) return 0;
-    if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
     if (tp->odl_active) return tp_odl_bulk_exchange(tp, out, in, bytes);
+#ifdef DS4_TP_LINUX
+    return tp_linux_gate(tp, 3, layer, 0, seq, out, in, bytes, 2000u);
+#endif
+    if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
 #ifdef DS4_TP_HAVE_VERBS
     static int dbg = -1;
     if (dbg < 0) dbg = getenv("DS4_TP_BIG_GATE_DEBUG") != NULL;
@@ -3683,6 +3882,78 @@ int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id) {
                          &session_id, sizeof(session_id));
 }
 
+int ds4_tp_send_restore_payload(ds4_tp *tp, uint64_t session_id,
+                                FILE *fp, uint64_t bytes,
+                                char *err, size_t errlen) {
+#ifdef DS4_TP_LINUX
+    const uint64_t header[2] = {session_id, bytes};
+    if (!tp || tp->rank != 0 || !session_id || !fp || !bytes || ds4_tp_failed(tp))
+        return 0;
+    const double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RESTORE_PAYLOAD,
+                       header, sizeof(header))) goto failed;
+    unsigned char buffer[65536];
+    while (bytes) {
+        const size_t count = bytes < sizeof(buffer) ? (size_t)bytes : sizeof(buffer);
+        if (tp_now_sec() >= deadline || fread(buffer, 1, count, fp) != count ||
+            !tp_write_full(tp->control_fd, buffer, count)) goto failed;
+        bytes -= count;
+    }
+    return ds4_tp_wait_command_ack(tp, session_id, "checkpoint restore", err, errlen);
+failed:
+    ds4_tp_mark_failed(tp);
+    tp_set_err(err, errlen, "tp: checkpoint transfer failed or timed out");
+    return 0;
+#else
+    (void)tp; (void)session_id; (void)fp; (void)bytes;
+    tp_set_err(err, errlen, "direct TP checkpoint restore requires Linux ROCm");
+    return 0;
+#endif
+}
+
+#ifdef DS4_TP_LINUX
+typedef struct {
+    ds4_tp *tp;
+    uint64_t remaining;
+    double deadline;
+} ds4_tp_payload_reader;
+
+static ssize_t tp_payload_read(void *cookie, char *buffer, size_t bytes) {
+    ds4_tp_payload_reader *r = cookie;
+    if (!r->remaining) return 0;
+    if (bytes > r->remaining) bytes = (size_t)r->remaining;
+    if (tp_now_sec() >= r->deadline ||
+        !tp_read_full(r->tp->control_fd, buffer, bytes)) {
+        ds4_tp_mark_failed(r->tp);
+        errno = EIO;
+        return -1;
+    }
+    r->remaining -= bytes;
+    return (ssize_t)bytes;
+}
+
+static int tp_worker_restore_payload(ds4_tp *tp, ds4_session *session,
+                                      uint64_t bytes, char *err, size_t errlen) {
+    ds4_tp_payload_reader reader = {tp, bytes, tp_now_sec() + (double)tp->timeout_sec};
+    cookie_io_functions_t io = {.read = tp_payload_read};
+    FILE *fp = fopencookie(&reader, "rb", io);
+    if (!fp) {
+        ds4_tp_mark_failed(tp);
+        tp_set_err(err, errlen, "tp: cannot open checkpoint input stream");
+        return 1;
+    }
+    int rc = ds4_session_load_payload(session, fp, bytes, err, errlen);
+    /* A rejected header can leave a body unread. Consume this bounded stream,
+     * including stdio read-ahead, before acknowledging another command. */
+    unsigned char discard[65536];
+    while (!ds4_tp_failed(tp) && fread(discard, 1, sizeof(discard), fp) != 0) {}
+    if (ferror(fp) || reader.remaining || ds4_tp_failed(tp)) rc = 1;
+    if (fclose(fp)) rc = 1;
+    if (rc) ds4_session_invalidate(session);
+    return rc;
+}
+#endif
+
 int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
                            uint32_t count) {
     const uint64_t bytes64 = sizeof(ds4_tp_batch_command_header) +
@@ -3944,6 +4215,17 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
     }
     int ok = 1;
     switch (ftype) {
+#ifdef DS4_TP_LINUX
+    case DS4_TP_FRAME_RESTORE_PAYLOAD: {
+        uint64_t header[2];
+        if (bytes != sizeof(header)) { ok = 0; break; }
+        memcpy(header, payload, sizeof(header));
+        if (!header[0] || !header[1]) { ok = 0; break; }
+        command->session_id = header[0];
+        command->payload_bytes = header[1];
+        break;
+    }
+#endif
     case DS4_TP_FRAME_SYNC:
     case DS4_TP_FRAME_VERIFY:
         ok = tp_command_decode_tokens(command, payload, bytes, err, errlen);
@@ -4451,6 +4733,17 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
             break;
         }
 
+#ifdef DS4_TP_LINUX
+        if (command.type == DS4_TP_FRAME_RESTORE_PAYLOAD) {
+            const int status = tp_worker_restore_payload(tp, session,
+                command.payload_bytes, err, sizeof(err));
+            if (ds4_tp_failed(tp) ||
+                !ds4_tp_send_command_ack(tp, command.session_id, status)) rc = 1;
+            ds4_tp_command_free(&command);
+            if (rc) break;
+            continue;
+        }
+#endif
         if (command.type == DS4_TP_FRAME_SYNC ||
             command.type == DS4_TP_FRAME_SYNC_MULTIMODAL) {
             prompt.len = 0;
