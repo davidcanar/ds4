@@ -92,7 +92,7 @@ static int small_gates(ds4_tp *tp, ds4_gpu_tensor *slab, ds4_gpu_tensor *x,
 
 int main(int argc, char **argv) {
     if (argc < 6 || argc > 9) {
-        fprintf(stderr, "usage: %s RANK COORDINATOR PORT tcp|rdma DEVICE [PORT GID] [fail]\n", argv[0]);
+        fprintf(stderr, "usage: %s RANK COORDINATOR PORT tcp|odl|rdma DEVICE [PORT GID] [fail]\n", argv[0]);
         return 2;
     }
     const int rank = atoi(argv[1]);
@@ -102,9 +102,11 @@ int main(int argc, char **argv) {
         .listen_port = atoi(argv[3]), .leader_port = atoi(argv[3]),
         .transport = DS4_TP_TRANSPORT_TCP};
     const bool roce = !strcmp(argv[4], "rdma");
+    const bool odl = !strcmp(argv[4], "odl");
     const int base_argc = roce ? 8 : 6;
     if ((argc != base_argc && argc != base_argc + 1) ||
-        (!roce && strcmp(argv[4], "tcp"))) return 2;
+        (!roce && !odl && strcmp(argv[4], "tcp"))) return 2;
+    if (odl) opt.transport = DS4_TP_TRANSPORT_ODL;
     if (roce) {
         opt.transport = DS4_TP_TRANSPORT_RDMA;
         opt.rdma_device = argv[5]; opt.rdma_port = atoi(argv[6]);

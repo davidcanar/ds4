@@ -984,6 +984,7 @@ static uint32_t tp_slot(const ds4_tp *tp, uint32_t layer, uint32_t gate) {
     return layer * DS4_TP_GATES_PER_LAYER + gate;
 }
 
+#ifndef DS4_TP_LINUX
 /* Slab slot a given gate seq lands in.  DS4 fires every slot in order
  * (identity mapping); GLM's schedule from the hello skips dense layers
  * and the ATTN slots. */
@@ -1011,6 +1012,7 @@ static uint32_t tp_gate_slot(const ds4_tp *tp, uint64_t seq) {
     return tp->gate_slot_start +
            (uint32_t)((seq - 1) % tp->gates_per_token) * tp->gate_slot_step;
 }
+#endif
 
 
 uint64_t ds4_tp_slab_out_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate) {
@@ -2513,8 +2515,6 @@ static void tp_rdma_close(ds4_tp *tp) {
 
 #endif /* DS4_TP_HAVE_VERBS */
 
-static uint32_t tp_gate_slot(const ds4_tp *tp, uint64_t seq);
-
 /* ------------------------------------------------------------------------
  * OdinLink path.
  * --------------------------------------------------------------------- */
@@ -2931,16 +2931,14 @@ static int tp_odl_exchange(ds4_tp *tp, const void *out, void *in,
     return 1;
 }
 
-/* One decode gate: the rank's partial for the slot out, the peer's into
- * the slot in, under the gate deadline. */
+/* One scalar gate: the rank's partial for the slot out, the peer's into
+ * the slot in, under the gate deadline. The GPU sequence also numbers batch
+ * and bulk-prefill jobs, so it is not a repeating decode-slot ordinal here.
+ * tp_odl_exchange maintains a separate wire sequence across every job kind
+ * and validates the peer's exchange and chunk numbers instead. */
 static int tp_odl_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate,
                                 uint64_t seq) {
-    const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
-    if (slot != tp_gate_slot(tp, seq)) {
-        fprintf(stderr, "ds4-tp: gate order broke: layer %u gate %u vs seq %llu\n",
-                layer, gate, (unsigned long long)seq);
-        return 0;
-    }
+    (void)seq;
     const uint64_t deadline_ms = tp->gate_timeout_ms ? tp->gate_timeout_ms
                                                      : tp->timeout_sec * 1000;
     pthread_mutex_lock(&tp->odl.lock);
