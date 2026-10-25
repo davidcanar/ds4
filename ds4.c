@@ -88599,17 +88599,29 @@ static int ds41_session_spec(ds4_session *s, int first_token,
     }
     s->mtp_draft_valid = false;
     ok = ds41_draft_rollback(g, tokens, n, matched + 1u, history);
+    bool tp_commit_failed = false;
     if (tp_verify) {
         const int32_t mode = ok && matched + 1u == n ?
             DS4_TP_VERIFY_COMMIT_FULL :
             ok ? DS4_TP_VERIFY_COMMIT_PREFIX :
                  DS4_TP_VERIFY_ROLLBACK_REPLAY;
         const int32_t count = ok ? (int32_t)(matched + 1u) : 0;
-        if (!ds4_tp_send_verify_commit(e->tp.ctx, mode, count)) ok = false;
+        if (!ds4_tp_send_verify_commit(e->tp.ctx, mode, count)) {
+            ok = false;
+            tp_commit_failed = true;
+            payload_set_err(err, errlen, "tp: V4.1 verify commit send failed");
+        } else if (!ds4_tp_wait_command_ack(e->tp.ctx, s->tp_session_id,
+                                            "V4.1 draft verify", err, errlen)) {
+            /* The worker acknowledges every V4.1 VERIFY command. Consume the
+             * reply before a later eval looks for its logits frame. */
+            ok = false;
+            tp_commit_failed = true;
+        }
     }
     s->checkpoint_valid = ok;
     if (!ok) {
-        payload_set_err(err, errlen, "DeepSeek V4.1 draft rollback failed");
+        if (!tp_commit_failed)
+            payload_set_err(err, errlen, "DeepSeek V4.1 draft rollback failed");
         return -1;
     }
     if (replacement >= 0) {
