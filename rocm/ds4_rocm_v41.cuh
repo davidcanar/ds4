@@ -1855,16 +1855,24 @@ extern "C" int ds4_gpu_dsv41_moe_tp_down(
     /* Counts, offsets, spare hot-list storage, then original six-slot pair IDs. */
     constexpr uint32_t offsets_at = 192u, hot_at = 385u, pairs_at = 578u;
     std::vector<uint32_t> metadata(pairs_at + (size_t)pairs, 0u);
-    uint32_t pos = 0;
+    /* Count once, then scatter in original pair order. This produces exactly
+     * the old expert-major metadata without 192 full scans of the selections. */
+    for (uint32_t p = 0; p < pairs; ++p) {
+        const uint32_t id = (uint32_t)ids[p];
+        if (id >= first && id < first + 192u) ++metadata[id - first];
+    }
+    uint32_t pos = 0, cursor[192];
     for (uint32_t e = 0; e < 192u; ++e) {
-        metadata[offsets_at + e] = pos;
-        for (uint32_t p = 0; p < pairs; ++p)
-            if ((uint32_t)ids[p] == first + e) {
-                metadata[pairs_at + pos++] = p;
-                ++metadata[e];
-            }
+        cursor[e] = pos;
+        pos += metadata[e];
+        metadata[offsets_at + e] = cursor[e];
     }
     metadata[offsets_at + 192u] = pos;
+    for (uint32_t p = 0; p < pairs; ++p) {
+        const uint32_t id = (uint32_t)ids[p];
+        if (id >= first && id < first + 192u)
+            metadata[pairs_at + cursor[id - first]++] = p;
+    }
     ds4_gpu_tensor *meta = ds4_gpu_tensor_alloc(metadata.size() * sizeof(uint32_t));
     ds4_gpu_tensor *mid_h = ds4_gpu_tensor_alloc(mids * sizeof(half));
     int ok = meta && mid_h;
