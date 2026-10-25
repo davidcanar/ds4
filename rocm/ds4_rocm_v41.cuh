@@ -1672,6 +1672,36 @@ typedef struct v41_tp_moe_table_cache_entry {
 
 static v41_tp_moe_table_cache_entry *g_v41_tp_moe_tables;
 
+typedef struct {
+    ds4_gpu_tensor *tensor;
+    uint64_t bytes;
+} v41_tp_moe_workspace;
+
+static v41_tp_moe_workspace g_v41_tp_moe_local_ids;
+static v41_tp_moe_workspace g_v41_tp_moe_meta;
+static v41_tp_moe_workspace g_v41_tp_moe_mid_h;
+
+static ds4_gpu_tensor *v41_tp_moe_workspace_get(v41_tp_moe_workspace *w, uint64_t bytes) {
+    if (w->tensor && w->bytes >= bytes) return w->tensor;
+    /* Capacity only grows at a new maximum shape. Drain before releasing a
+     * buffer that an earlier queued operation may still be using. */
+    if (w->tensor) {
+        if (!ds4_gpu_synchronize()) return nullptr;
+        ds4_gpu_tensor_free(w->tensor);
+        w->tensor = nullptr;
+        w->bytes = 0;
+    }
+    w->tensor = ds4_gpu_tensor_alloc(bytes);
+    if (w->tensor) w->bytes = bytes;
+    return w->tensor;
+}
+
+static void v41_tp_moe_workspace_reset(v41_tp_moe_workspace *w) {
+    ds4_gpu_tensor_free(w->tensor);
+    w->tensor = nullptr;
+    w->bytes = 0;
+}
+
 /* These tables contain only pointers into the resolved weight mapping. Cache
  * the actual addresses, not just layer offsets, so a changed model image or
  * chunk-cache mapping gets a fresh table. Runtime cleanup drains the GPU before
@@ -1723,6 +1753,9 @@ static void v41_tp_moe_table_cache_reset(void) {
         free(p);
         p = next;
     }
+    v41_tp_moe_workspace_reset(&g_v41_tp_moe_local_ids);
+    v41_tp_moe_workspace_reset(&g_v41_tp_moe_meta);
+    v41_tp_moe_workspace_reset(&g_v41_tp_moe_mid_h);
 }
 
 static int v41_tp_moe_down_with_ids(
@@ -1769,8 +1802,7 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
         moe_swiglu_weighted_f32_kernel<<<(uint32_t)((count + 255u) / 256u), 256>>>(
             (float *)mid->ptr, (const float *)gate->ptr, (const float *)up->ptr,
             (const float *)weights->ptr, count, 2304u, 10.f);
-        if (!cuda_ok(cudaGetLastError(), "V4.1 TP MMQ weighted activation") ||
-            !ds4_gpu_synchronize()) return 0;
+        if (!cuda_ok(cudaGetLastError(), "V4.1 TP MMQ weighted activation")) return 0;
         return v41_tp_moe_down_with_ids(out, scratch, mid, selected,
             model_map, model_size, down_offset, n_tokens, tp_rank, ids.data());
     }
@@ -1889,8 +1921,10 @@ static int v41_tp_moe_down_with_ids(
         if (id >= first && id < first + 192u)
             metadata[pairs_at + cursor[id - first]++] = p;
     }
-    ds4_gpu_tensor *meta = ds4_gpu_tensor_alloc(metadata.size() * sizeof(uint32_t));
-    ds4_gpu_tensor *mid_h = ds4_gpu_tensor_alloc(mids * sizeof(half));
+    ds4_gpu_tensor *meta = v41_tp_moe_workspace_get(&g_v41_tp_moe_meta,
+        metadata.size() * sizeof(uint32_t));
+    ds4_gpu_tensor *mid_h = v41_tp_moe_workspace_get(&g_v41_tp_moe_mid_h,
+        mids * sizeof(half));
     int ok = meta && mid_h;
     if (ok) ok = ds4_gpu_tensor_write(meta, 0, metadata.data(), metadata.size() * sizeof(uint32_t)) &&
         cuda_ok(cudaMemset(scratch->ptr, 0, pairs * 5120u * sizeof(half)),
@@ -1907,9 +1941,8 @@ static int v41_tp_moe_down_with_ids(
             m + pairs_at, m + hot_at, n_tokens, 192u, 6u, 2304u, 5120u,
             expert_bytes, 756u);
     }
-    if (!ds4_gpu_synchronize()) ok = 0;
-    ds4_gpu_tensor_free(mid_h);
-    ds4_gpu_tensor_free(meta);
+    /* Workspace is reused only after the next selection read has drained the
+     * preceding work. Runtime cleanup performs the final drain and release. */
     return ok;
 }
 
@@ -1964,7 +1997,8 @@ static int v41_tp_moe_gate_up_with_ids(
     const char *u = cuda_model_range_ptr(model_map, up_offset + first * expert_bytes,
                                          192u * expert_bytes, "V4.1 TP MMQ owned up");
     if (!g || !u) return 0;
-    ds4_gpu_tensor *local_ids = ds4_gpu_tensor_alloc(pairs * sizeof(int32_t));
+    ds4_gpu_tensor *local_ids = v41_tp_moe_workspace_get(&g_v41_tp_moe_local_ids,
+        pairs * sizeof(int32_t));
     if (!local_ids) return 0;
     int ok = ds4_gpu_tensor_write(local_ids, 0, local.data(), pairs * sizeof(int32_t)) &&
         ds4_gpu_tensor_fill_f32(gate, 0.f, pairs * 2304u) &&
@@ -1972,8 +2006,8 @@ static int v41_tp_moe_gate_up_with_ids(
     if (ok) ok = ds4_mmq_iq2_xxs_moe_pair(g, u, (const float *)x->ptr,
         (const int32_t *)local_ids->ptr, (float *)gate->ptr, (float *)up->ptr,
         2304, 5120, (int)n_tokens, 192, 6, (cudaStream_t)0) == 0;
-    if (!ds4_gpu_synchronize()) ok = 0;
-    ds4_gpu_tensor_free(local_ids);
+    /* Keep the ID workspace alive across calls. The next selection read or a
+     * capacity-growing allocation drains prior use; runtime cleanup releases it. */
     return ok;
 }
 
