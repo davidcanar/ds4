@@ -74001,7 +74001,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
             "tensor parallelism bound: rank %d, %s, %s transport",
             e->tp.rank, e->cuda_tp_expert_split ? "MXFP4 expert intermediate split" :
                                                "50/50 expert ownership",
-            ds4_tp_is_rdma(tp) ? "rdma" : "tcp");
+            ds4_tp_is_odl(tp) ? "odl" : ds4_tp_is_rdma(tp) ? "rdma" : "tcp");
     return 1;
 fail:
     ds4_engine_tp_unbind(e);
